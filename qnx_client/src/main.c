@@ -1,3 +1,93 @@
+/*
+ * qnx_client/src/main.c -- STAGE 2b + zombies/HUD.
+ *
+ * Builds on Stage 2a (validated on real hardware: level renders
+ * correctly, WASD/mouse-look camera works). New this stage:
+ *
+ *   - REAL network input: the heartbeat placeholder from Stage 1/2a
+ *     is gone. The network thread now sends the actual held WASD
+ *     state, the camera's real yaw/pitch, and whether the player is
+ *     shooting (left mouse button OR Enter -- see below) every tick.
+ *   - The network thread now parses the FULL PktState (every player,
+ *     every zombie, not just the counts printed before) into a
+ *     mutex-protected shared struct the render thread reads once per
+ *     frame. This is the one place in this file that needs real
+ *     synchronization -- the scalar flags elsewhere (g_connected,
+ *     g_key_w, etc.) stay plain `volatile`, matching the rest of this
+ *     project's "good enough for a hackathon" approach to cross-
+ *     thread scalars, but a whole snapshot of every entity is a much
+ *     more likely place for a torn read to actually look wrong on
+ *     screen, so it gets a real mutex.
+ *   - Zombies and other players are rendered as flat-colored boxes
+ *     (green for zombies, yellow for teammates), built fresh into a
+ *     dynamic vertex buffer every frame from that shared snapshot --
+ *     unlike the level, which is static geometry uploaded once.
+ *   - A HUD: health/ammo/wave/zombies-left as 7-segment digit
+ *     numbers (see hud_render.c for why -- no font rendering in
+ *     GLES2, and pulling in a text-rendering library was out of
+ *     scope), plus a crosshair. Drawn as a 2D overlay after the 3D
+ *     scene, depth test disabled, using the same shader with an
+ *     identity MVP (hud_render.c already emits NDC coordinates
+ *     directly).
+ *   - E as a fallback shoot button, alongside the left mouse button,
+ *     for players using arrow-key-only look. Checked as a plain ASCII
+ *     letter (same as W/A/S/D). Originally this used Enter, checked
+ *     via raw ASCII '\r'/'\n' -- that didn't work in practice on real
+ *     hardware (Enter apparently doesn't report as plain CR/LF the
+ *     way this console/BSP delivers key events), so it was swapped
+ *     for a plain letter key instead, which is already confirmed
+ *     working via WASD.
+ *   - Jump: Space bar, only while grounded, with real gravity while
+ *     airborne (GRAVITY/JUMP_VELOCITY, matching the Godot client's
+ *     values for a consistent feel). Purely local, like the Godot
+ *     client's jump -- the server has no concept of player height at
+ *     all, so this never touches the network. Rising-edge detected
+ *     (g_jump_requested) so holding Space doesn't re-jump every
+ *     frame; grounded/airborne is tracked explicitly (Camera.jumping)
+ *     rather than inferred, since there's no physics engine here to
+ *     ask "am I touching the floor" the way Godot's CharacterBody3D
+ *     can.
+ *   - Ammo/health pickups render as small colored boxes (amber/brass
+ *     for ammo, red for health, matching Pickup.gd), hidden while on
+ *     cooldown. Purely a rendering addition -- the server already
+ *     fully implements pickup/cooldown logic (see net.h's PickupState
+ *     and server.c's pickup handling), this client just wasn't
+ *     parsing or drawing that data before now.
+ *   - A main menu: Play Solo / Play Coop / Quit. GLES2 has no text
+ *     rendering (see hud_render.c), so this is a NUMBERED menu
+ *     (1/2/3), not a word-based one -- each option is a distinct
+ *     color plus its number, the current selection shown at full
+ *     brightness and the others dimmed. Navigated with the same
+ *     arrow keys used for look in-game and confirmed with the same E
+ *     key used for shooting -- safe to reuse since they're read by
+ *     entirely different code depending on g_app_state. The network
+ *     thread does NOT start until Play Solo/Coop is confirmed here;
+ *     Quit exits before ever connecting. "Settings"/"Credits" from
+ *     the Godot client aren't here -- Settings would need either
+ *     text input (not feasible) or a fully custom numeric-only UI,
+ *     and Credits has no functional value without text, so both were
+ *     left out rather than built half-working.
+ *
+ * KNOWN LIMITATIONS carried over / new this stage:
+ *   - Mouse look still sticks at the screen edge (see the README);
+ *     arrow-key look is the documented workaround, not a fix for that.
+ *   - The camera's rendered (x, z) position is now pulled toward the
+ *     server's authoritative position every frame (see
+ *     reconcile_camera()) -- this turned out to be essential, not
+ *     just nice-to-have: without it, zombie AI/hit detection/damage
+ *     (all computed server-side against the server's own belief of
+ *     where you are) could silently diverge from what's on screen,
+ *     which is what "zombie won't chase me / can't hit it / take
+ *     damage from nowhere" turned out to be. Height (y) is still
+ *     fully local -- the server has no concept of player elevation,
+ *     same as always.
+ *   - The mouse-button constant used below (SCREEN_LEFT_MOUSE_BUTTON)
+ *     is the least-confirmed API name in this file -- if it fails to
+ *     compile, checking the actual button-type enum name in your
+ *     target's screen.h is a quick, obvious fix (a compile error, not
+ *     a silent bug).
+ */
+
 #include <screen/screen.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -21,24 +111,76 @@
 #include "level_geo.h"
 #include "hud_render.h"
 
-#define WINDOW_W 1280   /* fallback resolution */
+#define WINDOW_W 1280   /* fallback only -- actual size is auto-detected from
+                         * the display at startup, see main()'s Screen setup */
 #define WINDOW_H 720
 
 #define EYE_HEIGHT   1.4f    /* matches src/server.c's PLAYER_EYE_HEIGHT */
-#define MOVE_SPEED   3.0f    /* world units/sec */
-#define CLIMB_SPEED  1.0f    /* matches src/server.c's ZOMBIE_CLIMB_SPEED */
+#define MOVE_SPEED   3.0f    /* world units/sec -- local free-cam only in
+                              * this stage, not yet tied to server MOVE_SPEED */
+
+/* App state -- defined up here since several globals below reference
+ * these before the "Menu" section further down. */
+#define APP_STATE_MENU    0
+#define APP_STATE_PLAYING 1
+#define MENU_OPTION_SOLO   0
+#define MENU_OPTION_COOP   1
+#define MENU_OPTION_QUIT   2
+#define MENU_OPTION_COUNT  3
+/* Floor/platform height transitions (NOT ramps -- those are fully
+ * continuous now, see level_continuous_ramp_height(), and need no
+ * easing at all). These only apply to the flat-to-flat step case,
+ * e.g. reaching the top of a ramp and stepping onto the platform
+ * proper, or walking off a platform edge without jumping. Asymmetric
+ * on purpose: falling faster than rising is what reads as "weight"
+ * rather than floating up and down at the same rate.
+ * COUPLING: mirrors src/server.c's ZOMBIE_CLIMB_SPEED_UP/DOWN, so
+ * zombies feel the same "weight" as the player. */
+#define CLIMB_SPEED_UP   3.0f
+#define CLIMB_SPEED_DOWN 8.0f
 #define MOUSE_SENS   0.003f
 #define LOOK_SPEED   2.0f    /* radians/sec, arrow-key look */
-#define RECONCILE_LERP 0.08f /* per render frame (~60Hz) */
-#define GRAVITY       9.8f   /* matches the Godot client's Player.gd, for
-                              * a consistent feel between the two clients */
-#define JUMP_VELOCITY 4.5f   /* matches the Godot client's Player.gd */
+#define RECONCILE_LERP 0.08f /* per render frame (~60Hz), not per network
+                              * tick (20Hz) -- see reconcile_camera()'s
+                              * comment for why this is now essential, not
+                              * just nice-to-have */
+#define GRAVITY       14.0f  /* raised from a "realistic" 9.8 for a
+                              * snappier, weightier fall -- matches the
+                              * general ask for player/zombie "weight",
+                              * not just the walk-off-a-ledge case above */
+#define JUMP_VELOCITY 5.0f   /* raised alongside GRAVITY to keep a similar
+                              * jump apex (~0.9 units, was ~1.0) despite
+                              * the faster fall */
+#define PLATFORM_ELEVATED_THRESHOLD (LEVEL_PLATFORM_HEIGHT * 0.6f)
+                              /* How far off the ground (not counting
+                               * EYE_HEIGHT) the camera has to already be
+                               * before a platform tile's footprint counts
+                               * as solid ground under your feet, rather
+                               * than a ceiling above you -- see
+                               * ground_height_for_camera(). Set above the
+                               * max reachable jump apex (v^2/2g =~ 1.03
+                               * with the constants above) so jumping near
+                               * a platform edge can't falsely trigger it. */
 
 /* ------------------------------------------------------------------ */
 /* Shared scalar state -- plain volatile, matching the rest of this    */
 /* project's cross-thread convention for simple flags/values.          */
 /* ------------------------------------------------------------------ */
 static volatile int g_running   = 1;
+static volatile int g_net_thread_running = 0;   /* separate from g_running --
+                                                 * controls just the network
+                                                 * thread's own loop, so
+                                                 * "return to menu" can stop
+                                                 * it without quitting the
+                                                 * whole app */
+static volatile int g_return_to_menu_requested = 0;   /* ESC while playing --
+                                                        * edge-triggered like
+                                                        * g_jump_requested */
+static volatile int g_app_state = APP_STATE_MENU;   /* readable by
+                                                      * handle_keyboard_event
+                                                      * so ESC can behave
+                                                      * differently in the
+                                                      * menu vs. in-game */
 static volatile int g_connected = 0;
 static volatile u8  g_my_id     = 0xFF;
 static volatile f32 g_spawn_x, g_spawn_y, g_spawn_angle;
@@ -52,6 +194,22 @@ static volatile int g_jump_requested = 0;   /* set on the down-transition only,
                                              * consumed once by update_camera() --
                                              * avoids re-jumping every frame
                                              * while the key is held */
+
+/* ---- Menu ----
+ * GLES2 has no text rendering, and pulling in a font/texture-atlas
+ * library was out of scope (same reasoning as hud_render.c's 7-segment
+ * digits) -- so the menu is NUMBERED (1/2/3) rather than word-based,
+ * navigated with the same arrow keys used for look in-game, and
+ * confirmed with the same E key used for shooting in-game. Reusing
+ * KEYCODE_UP/DOWN and 'e' for two different purposes is safe since
+ * they're read by completely different code paths depending on
+ * g_app_state (declared above). */
+static volatile int g_menu_nav_up_requested   = 0;
+static volatile int g_menu_nav_down_requested = 0;
+static volatile int g_menu_confirm_requested  = 0;
+static volatile int g_connect_mode = CONNECT_MODE_COOP;   /* set by the menu
+                                                            * before the net
+                                                            * thread starts */
 static volatile int g_mouse_left_down = 0;
 static volatile f32 g_cam_yaw = 0.0f, g_cam_pitch = 0.0f;
 
@@ -62,7 +220,8 @@ static int                g_sock = -1;
 static struct sockaddr_in g_server_addr;
 
 /* ------------------------------------------------------------------ */
-/* Shared entity (mutex)                                               */
+/* Shared entity snapshot -- the one place that gets a real mutex,     */
+/* per the reasoning in the file header comment above.                 */
 /* ------------------------------------------------------------------ */
 typedef struct {
     u8  id;
@@ -92,8 +251,10 @@ typedef struct {
     RenderPickup pickups[MAX_PICKUP_SPAWNS];
     int          pickup_count;
     u8           wave;
-    int          has_my_state;   /* false until the first PktState with player entry arrives */
-    f32          my_x, my_y;     /* server's authoritative position for the player */
+    int          has_my_state;   /* false until the first PktState with our
+                                  * own player entry arrives */
+    f32          my_x, my_y;     /* server's authoritative position for THIS
+                                  * player -- see reconcile_camera() in main() */
     u8           my_health;
     u8           my_ammo;
 } SharedGameState;
@@ -112,19 +273,19 @@ static void *net_thread_main(void *arg)
     (void)arg;
 
     deadline = portable_time() + 8.0;
-    while (!g_connected && g_running && portable_time() < deadline) {
+    while (!g_connected && g_net_thread_running && portable_time() < deadline) {
         PktConnect pkt;
         double wait_until;
 
         memset(&pkt, 0, sizeof(pkt));
         pkt.hdr.type = PKT_CONNECT;
         pkt.hdr.tick = local_tick++;
-        pkt.mode     = CONNECT_MODE_COOP;
+        pkt.mode     = (u8)g_connect_mode;
         sendto(g_sock, &pkt, sizeof(pkt), 0,
                (struct sockaddr *)&g_server_addr, sizeof(g_server_addr));
 
         wait_until = portable_time() + 0.5;
-        while (g_running && !g_connected && portable_time() < wait_until) {
+        while (g_net_thread_running && !g_connected && portable_time() < wait_until) {
             ssize_t n = recvfrom(g_sock, buf, sizeof(buf), 0, NULL, NULL);
             if (n >= (ssize_t)sizeof(PktHeader)) {
                 PktHeader *hdr = (PktHeader *)buf;
@@ -148,7 +309,7 @@ static void *net_thread_main(void *arg)
         return NULL;
     }
 
-    while (g_running) {
+    while (g_net_thread_running) {
         PktInput inp;
         ssize_t  n;
         int      shoot_held = g_mouse_left_down || g_key_e;
@@ -274,7 +435,7 @@ static int start_net_thread_with_scheduling(pthread_t *out_tid)
 }
 
 /* ------------------------------------------------------------------ */
-/* GLES2 shader pipeline                                               */
+/* GLES2 shader pipeline -- unchanged from Stage 2a.                    */
 /* ------------------------------------------------------------------ */
 static const char *VERTEX_SHADER_SRC =
     "attribute vec3 a_position;\n"
@@ -354,7 +515,7 @@ static void draw_vertex_list(GLuint vbo, GLint pos_loc, GLint color_loc, int ver
 typedef struct {
     f32 x, y, z;
     f32 yaw, pitch;
-    f32 vel_y;      /* vertical velocity, for jumping, 0 while grounded */
+    f32 vel_y;      /* vertical velocity, for jumping -- 0 while grounded */
     int jumping;    /* true from the moment of a jump until landing again */
 } Camera;
 
@@ -371,16 +532,35 @@ static void handle_keyboard_event(screen_event_t ev, Camera *cam)
     else if (lower == 'a') g_key_a = down;
     else if (lower == 's') g_key_s = down;
     else if (lower == 'd') g_key_d = down;
-    else if (lower == 'e') g_key_e = down;   /* fallback shoot */
-    else if (sym == ' ') {   /* jump */
+    else if (lower == 'e') {
+        if (down && !g_key_e) g_menu_confirm_requested = 1;   /* menu confirm --
+                                                               * only read while
+                                                               * g_app_state ==
+                                                               * APP_STATE_MENU */
+        g_key_e = down;   /* fallback shoot -- plain ASCII letter like WASD,
+                          * unlike Enter which turned out not to report as
+                          * plain '\r'/'\n' on real hardware */
+    }
+    else if (sym == ' ') {   /* jump -- ASCII 0x20, plain printable char like WASD */
         if (down && !g_key_space) g_jump_requested = 1;   /* rising edge only */
         g_key_space = down;
     }
     else if (sym == KEYCODE_LEFT)  g_key_look_left  = down;
     else if (sym == KEYCODE_RIGHT) g_key_look_right = down;
-    else if (sym == KEYCODE_UP)    g_key_look_up    = down;
-    else if (sym == KEYCODE_DOWN)  g_key_look_down  = down;
-    else if (sym == KEYCODE_ESCAPE && down) g_running = 0;
+    else if (sym == KEYCODE_UP) {
+        if (down && !g_key_look_up) g_menu_nav_up_requested = 1;   /* menu nav --
+                                                                    * only read
+                                                                    * in APP_STATE_MENU */
+        g_key_look_up = down;
+    }
+    else if (sym == KEYCODE_DOWN) {
+        if (down && !g_key_look_down) g_menu_nav_down_requested = 1;
+        g_key_look_down = down;
+    }
+    else if (sym == KEYCODE_ESCAPE && down) {
+        if (g_app_state == APP_STATE_PLAYING) g_return_to_menu_requested = 1;
+        else g_running = 0;   /* ESC while already in the menu still quits the app */
+    }
 }
 
 static void handle_pointer_event(screen_event_t ev, Camera *cam)
@@ -406,18 +586,61 @@ static void handle_pointer_event(screen_event_t ev, Camera *cam)
 }
 
 /* Moves the camera per the currently-held WASD/arrow keys, with wall
- * collision via map_is_wall() and ramp/platform height easing. 
- * Also mirrors the resulting look angle into the shared g_cam_yaw/g_cam_pitch 
- * so the network thread can send
+ * collision via map_is_wall() and ramp/platform height easing --
+ * unchanged from Stage 2a. Also mirrors the resulting look angle into
+ * the shared g_cam_yaw/g_cam_pitch so the network thread can send
  * real look angles.
- */
+ *
+ * COUPLING WARNING, and the actual root cause of "zombie won't die /
+ * WASD feels random": this client's own `cam->yaw` is just an angle
+ * this file uses internally to build the forward/right vectors below
+ * -- it has no reason to already match src/server.c's own convention,
+ * where facing direction is computed as (cosf(angle), sinf(angle)).
+ * Sending cam->yaw to the server directly (which the first version of
+ * this file did) means the server computes a DIFFERENT "forward" than
+ * what's actually rendered -- a fixed rotational mismatch. Since
+ * shooting/hit-detection use the server's own angle, and since
+ * reconcile_camera() pulls this camera toward wherever the server
+ * moved the player using that same (wrong) angle, the visible result
+ * was exactly what got reported: shots aimed at a visually-correct
+ * target still missed server-side, and WASD felt like it was fighting
+ * itself as reconciliation pulled the camera toward a server position
+ * that had moved in a rotated direction relative to the actual input.
+ * Fix: derive the angle actually sent to the server from the already-
+ * computed forward vector via atan2 (see the end of this function),
+ * the same technique used for the Godot client's Player.gd for the
+ * identical reason -- self-consistent by construction instead of
+ * hand-deriving the exact offset between two conventions. */
+/* Computes the floor height (not including EYE_HEIGHT) the camera's
+ * feet should be at, given its CURRENT floor-relative height.
+ *   - Ramp tiles: the exact CONTINUOUS position-based height (see
+ *     level_continuous_ramp_height()) -- always correct regardless of
+ *     current height, since a ramp is inherently "the sloped surface
+ *     here". The caller (update_camera) snaps directly to this, no
+ *     easing, which is what actually fixes the climbing-lag bug.
+ *   - Platform tiles: gated by current height -- only treated as
+ *     solid ground if already substantially elevated (i.e. arrived
+ *     via the ramp), otherwise this is "walking under the platform",
+ *     and the floor here is still 0. Without this gate, merely
+ *     walking into a platform's horizontal footprint from below would
+ *     incorrectly pull the camera straight up onto it.
+ *   - Everything else: flat floor, 0. */
+static f32 target_floor_height(f32 x, f32 y, f32 current_floor_height)
+{
+    int mx = (int)x, my = (int)y;
+    int t = map_tile(mx, my);
+    if (t == TILE_RAMP)     return level_continuous_ramp_height(x, y);
+    if (t == TILE_PLATFORM) return (current_floor_height > PLATFORM_ELEVATED_THRESHOLD)
+                                  ? LEVEL_PLATFORM_HEIGHT : 0.0f;
+    return 0.0f;
+}
+
 static void update_camera(Camera *cam, f32 dt)
 {
     f32 fx, fz, rx, rz;
     f32 mvx = 0.0f, mvz = 0.0f;
     f32 len;
     f32 new_x, new_z, target_y;
-    int tile_mx, tile_my;
 
     if (g_key_look_left)  cam->yaw += LOOK_SPEED * dt;
     if (g_key_look_right) cam->yaw -= LOOK_SPEED * dt;
@@ -446,18 +669,28 @@ static void update_camera(Camera *cam, f32 dt)
         if (!map_is_wall((int)cam->x, (int)new_z)) cam->z = new_z;
     }
 
-    tile_mx = (int)cam->x;
-    tile_my = (int)cam->z;
-    target_y = level_height_for_tile(tile_mx, tile_my) + EYE_HEIGHT;
+    target_y = target_floor_height(cam->x, cam->z, cam->y - EYE_HEIGHT) + EYE_HEIGHT;
 
     if (!cam->jumping) {
-        f32 climb_step = CLIMB_SPEED * dt;
-        if (cam->y < target_y) {
-            cam->y += climb_step;
-            if (cam->y > target_y) cam->y = target_y;
-        } else if (cam->y > target_y) {
-            cam->y -= climb_step;
-            if (cam->y < target_y) cam->y = target_y;
+        if (map_tile((int)cam->x, (int)cam->z) == TILE_RAMP) {
+            /* Continuous target -- nothing to catch up to, so snap
+             * directly. This is the actual climbing-lag fix: easing
+             * toward a target that itself moves smoothly with
+             * position just adds unnecessary (and, at the old rate,
+             * too-slow) lag on top of an already-smooth function. */
+            cam->y = target_y;
+        } else {
+            /* Floor/platform: a real discrete step (e.g. reaching the
+             * platform proper, or walking off its edge), eased
+             * asymmetrically for the "weight" feel -- see
+             * CLIMB_SPEED_UP/DOWN. */
+            if (cam->y < target_y) {
+                cam->y += CLIMB_SPEED_UP * dt;
+                if (cam->y > target_y) cam->y = target_y;
+            } else if (cam->y > target_y) {
+                cam->y -= CLIMB_SPEED_DOWN * dt;
+                if (cam->y < target_y) cam->y = target_y;
+            }
         }
 
         if (g_jump_requested) {
@@ -466,23 +699,38 @@ static void update_camera(Camera *cam, f32 dt)
             cam->jumping = 1;
         }
     } else {
+        /* Airborne: real gravity, not the easing above -- a jump
+         * needs an actual arc, not a constant-speed glide. */
         cam->vel_y -= GRAVITY * dt;
         cam->y     += cam->vel_y * dt;
 
         if (cam->y <= target_y) {
-            cam->y      = target_y;   
+            cam->y      = target_y;   /* landed */
             cam->vel_y  = 0.0f;
             cam->jumping = 0;
         }
     }
 
-    g_cam_yaw   = atan2f(fz, fx);
+    g_cam_yaw   = atan2f(fz, fx);   /* NOT cam->yaw directly -- see the
+                                     * COUPLING WARNING at the top of this
+                                     * function for why */
     g_cam_pitch = cam->pitch;
 }
 
 /* Pulls the camera's (x, z) toward the server's authoritative position
- * for this player
- */
+ * for this player -- NOT y (height), which stays fully local (ramp/
+ * platform climbing has no server-side equivalent for players, same
+ * as the Godot client's reconciliation preserving local Y).
+ *
+ * This is not just cosmetic smoothing: zombie AI, hit detection, and
+ * damage are ALL computed server-side against the server's own (x,y)
+ * for this player, not against wherever this camera is actually
+ * rendered. Without this pull, the two positions can drift arbitrarily
+ * far apart over time (different movement speed constants, different
+ * wall-collision edge cases, etc.), which is what "zombie doesn't
+ * chase me / my shots don't land / I take damage from nowhere" all
+ * turned out to be -- the server was correctly simulating a player
+ * standing somewhere this camera wasn't. */
 static void reconcile_camera(Camera *cam)
 {
     int has_state;
@@ -500,7 +748,9 @@ static void reconcile_camera(Camera *cam)
     cam->z += (server_y - cam->z) * RECONCILE_LERP;
 }
 
-/* Builds a fresh vertex list for every zombie/other-player */
+/* Builds a fresh vertex list for every zombie/other-player in the
+ * latest shared snapshot -- called once per frame, unlike the level's
+ * static geometry which is built once at startup. */
 static VertexList build_entity_geometry(void)
 {
     VertexList vl;
@@ -524,24 +774,24 @@ static VertexList build_entity_geometry(void)
         if (!players[i].alive) continue;
         push_box(&vl, players[i].x, 0.8f, players[i].y,
                  0.3f, 0.8f, 0.3f,
-                 0.9f, 0.75f, 0.1f);   /* yellow */
+                 0.9f, 0.75f, 0.1f);   /* yellow -- teammate, matches RemotePlayer.gd */
     }
     for (i = 0; i < zombie_count; i++) {
         if (!zombies[i].alive) continue;
         push_box(&vl, zombies[i].x, zombies[i].z + 0.9f, zombies[i].y,
                  0.35f, 0.9f, 0.35f,
-                 0.25f, 0.55f, 0.2f);   /* green */
+                 0.25f, 0.55f, 0.2f);   /* sickly green, matches Zombie.gd */
     }
     for (i = 0; i < pickup_count; i++) {
-        if (!pickups[i].active) continue;   /* on cooldown, hidden */
+        if (!pickups[i].active) continue;   /* on cooldown -- hidden, matches Pickup.gd */
         if (pickups[i].type == PICKUP_AMMO) {
             push_box(&vl, pickups[i].x, 0.9f, pickups[i].y,
                      0.175f, 0.175f, 0.175f,
-                     0.9f, 0.7f, 0.15f);    /* brass */
+                     0.9f, 0.7f, 0.15f);    /* amber/brass, matches Pickup.gd */
         } else {
             push_box(&vl, pickups[i].x, 0.9f, pickups[i].y,
                      0.175f, 0.175f, 0.175f,
-                     0.85f, 0.15f, 0.2f);   /* red */
+                     0.85f, 0.15f, 0.2f);   /* red cross-ish, matches Pickup.gd */
         }
     }
 
@@ -549,12 +799,43 @@ static VertexList build_entity_geometry(void)
 }
 
 /* Builds the HUD overlay for the current frame: crosshair + health/
- * ammo/wave/zombies-left as 7-segment numbers. */
+ * ammo (as "current / max", using a lit "1" as the separator -- see
+ * the caller's note on why) + wave/zombies-left as plain numbers.
+ *
+ * COUPLING WARNING: PLAYER_MAX_HEALTH/PLAYER_MAX_AMMO must match
+ * src/server.c's initial health (100) and AMMO_MAX. The server never
+ * sends a "max" value over the wire, only current -- these are only
+ * used here to know what to show on the right of the "/". */
+#define PLAYER_MAX_HEALTH 100
+#define PLAYER_MAX_AMMO   60
+
+/* Renders "current [1-as-separator] max" starting at (px, py) --
+ * chains three hud_push_number() calls, using hud_number_width() to
+ * space them correctly regardless of digit count. The separator is
+ * dimmer than the two numbers so it reads as a divider rather than a
+ * third value, on top of the "1" glyph's own vertical-bar shape
+ * already looking slash-like between two numbers. */
+static f32 push_stat_ratio(VertexList *vl, int current, int max, f32 px, f32 py,
+                          f32 digit_w, f32 digit_h, int win_w, int win_h,
+                          f32 r, f32 g, f32 b)
+{
+    f32 x = px;
+    hud_push_number(vl, current, x, py, digit_w, digit_h, win_w, win_h, r, g, b);
+    x += hud_number_width(current, digit_w);
+    hud_push_number(vl, 1, x, py, digit_w, digit_h, win_w, win_h, r * 0.6f, g * 0.6f, b * 0.6f);
+    x += hud_number_width(1, digit_w);
+    hud_push_number(vl, max, x, py, digit_w, digit_h, win_w, win_h, r, g, b);
+    x += hud_number_width(max, digit_w);
+    return x - px;   /* total width, for right-aligning callers */
+}
+
 static VertexList build_hud_geometry(int win_w, int win_h)
 {
     VertexList vl;
     u8  health, ammo, wave;
     int zombie_count;
+    const f32 digit_w = 20.0f, digit_h = 32.0f;
+    f32 ammo_width;
 
     memset(&vl, 0, sizeof(vl));
 
@@ -567,18 +848,77 @@ static VertexList build_hud_geometry(int win_w, int win_h)
 
     hud_push_crosshair(&vl, win_w, win_h, 1.0f, 1.0f, 1.0f);
 
-    /* bottom-left: health */
-    hud_push_number(&vl, (int)health, 24.0f, (f32)win_h - 56.0f, 20.0f, 32.0f,
-                    win_w, win_h, 0.2f, 0.9f, 0.2f);
-    /* bottom-right: ammo */
-    hud_push_number(&vl, (int)ammo, (f32)win_w - 140.0f, (f32)win_h - 56.0f, 20.0f, 32.0f,
-                    win_w, win_h, 0.9f, 0.7f, 0.15f);
+    /* bottom-left: health, e.g. "100/100" */
+    push_stat_ratio(&vl, (int)health, PLAYER_MAX_HEALTH, 24.0f, (f32)win_h - 56.0f,
+                    digit_w, digit_h, win_w, win_h, 0.2f, 0.9f, 0.2f);
+
+    /* bottom-right: ammo, e.g. "60/60" -- right-aligned using the
+     * computed width so the right edge stays fixed regardless of how
+     * many digits the current value has (measured with a throwaway
+     * VertexList first, since we need the width before knowing where
+     * to actually start drawing). */
+    {
+        VertexList measure;
+        memset(&measure, 0, sizeof(measure));
+        ammo_width = push_stat_ratio(&measure, (int)ammo, PLAYER_MAX_AMMO, 0.0f, 0.0f,
+                                     digit_w, digit_h, win_w, win_h, 0, 0, 0);
+        vertex_list_free(&measure);
+    }
+    push_stat_ratio(&vl, (int)ammo, PLAYER_MAX_AMMO,
+                    (f32)win_w - 24.0f - ammo_width, (f32)win_h - 56.0f,
+                    digit_w, digit_h, win_w, win_h, 0.9f, 0.7f, 0.15f);
+
     /* top-right: wave */
     hud_push_number(&vl, (int)wave, (f32)win_w - 140.0f, 24.0f, 20.0f, 32.0f,
                     win_w, win_h, 0.8f, 0.8f, 0.9f);
     /* top-left: zombies remaining */
     hud_push_number(&vl, zombie_count, 24.0f, 24.0f, 20.0f, 32.0f,
                     win_w, win_h, 0.9f, 0.3f, 0.3f);
+
+    return vl;
+}
+
+/* Builds the main menu: three numbered, color-coded selection boxes
+ * (1=Solo, 2=Coop, 3=Quit), stacked vertically and horizontally
+ * centered on win_w -- no text anywhere, per the GLES2-has-no-font-
+ * rendering constraint noted at the top of this file; the number
+ * inside each box plus its distinct color is what distinguishes the
+ * options. The current selection is shown at full brightness, the
+ * other two dimmed, rather than drawing a separate border/highlight
+ * box -- simpler, and avoids the exact seam/z-fighting-in-2D
+ * questions a separate outline box would raise. */
+static VertexList build_menu_geometry(int win_w, int win_h, int selection)
+{
+    VertexList vl;
+    const f32 box_w = 320.0f, box_h = 70.0f, spacing = 100.0f;
+    const f32 base_colors[MENU_OPTION_COUNT][3] = {
+        { 0.25f, 0.70f, 0.30f },   /* 1: Solo -- green */
+        { 0.25f, 0.45f, 0.85f },   /* 2: Coop -- blue */
+        { 0.65f, 0.20f, 0.20f },   /* 3: Quit -- red */
+    };
+    f32 first_top = (f32)win_h * 0.35f;
+    f32 cx = (f32)win_w * 0.5f;
+    int i;
+
+    memset(&vl, 0, sizeof(vl));
+
+    for (i = 0; i < MENU_OPTION_COUNT; i++) {
+        f32 top    = first_top + (f32)i * spacing;
+        f32 bottom = top + box_h;
+        f32 left   = cx - box_w * 0.5f;
+        f32 right  = cx + box_w * 0.5f;
+        f32 dim    = (i == selection) ? 1.0f : 0.45f;   /* selected = full
+                                                          * brightness */
+        f32 r = base_colors[i][0] * dim;
+        f32 g = base_colors[i][1] * dim;
+        f32 b = base_colors[i][2] * dim;
+
+        hud_push_quad(&vl, left, top, right, bottom, win_w, win_h, r, g, b);
+
+        /* Number, left-aligned inside the box, vertically centered. */
+        hud_push_digit(&vl, i + 1, left + 24.0f, top + (box_h - 40.0f) * 0.5f,
+                       24.0f, 40.0f, win_w, win_h, 1.0f, 1.0f, 1.0f);
+    }
 
     return vl;
 }
@@ -639,10 +979,11 @@ int main(int argc, char **argv)
         perror("screen_create_context"); return 1;
     }
 
-    /* Query the real display resolution using SCREEN_PROPERTY_SIZE used on a
-     * display object reports the width and height, in pixels, of the
-     * current video resolution.
-     */
+    /* Query the real display resolution -- SCREEN_PROPERTY_SIZE on a
+     * DISPLAY object reports "the width and height, in pixels, of the
+     * current video resolution" per QNX's own Screen API docs.
+     * Enumerate via the context's SCREEN_PROPERTY_DISPLAY_COUNT /
+     * SCREEN_PROPERTY_DISPLAYS first to get a display handle at all. */
     {
         int display_count = 0;
         screen_display_t displays[8];
@@ -732,95 +1073,203 @@ int main(int argc, char **argv)
     glGenBuffers(1, &hud_vbo);
 
     glEnable(GL_DEPTH_TEST);
-    /* Deliberately NOT calling glEnable(GL_CULL_FACE) */
+    /* Deliberately NOT calling glEnable(GL_CULL_FACE) -- see the
+     * comment on FACES in level_geo.c for why. */
 
-    /* ---- RTOS scheduling + network thread ---- */
-    if (start_net_thread_with_scheduling(&net_tid) != 0)
-        fprintf(stderr, "Continuing without networking\n");
+    /* ---- app state: starts in the menu; the network thread doesn't
+     * start until Play Solo/Coop is confirmed there ---- */
+    {
+        int menu_selection  = MENU_OPTION_SOLO;
+        int net_thread_started = 0;
 
-    /* ---- camera starting position: center of the map, looking down
-     * -Z, standing on the floor ---- */
-    cam.x = (MAP_W * 0.5f);
-    cam.z = (MAP_ROWS * 0.5f);
-    cam.y = EYE_HEIGHT;
-    cam.yaw = 0.0f;
-    cam.pitch = 0.0f;
-    cam.vel_y = 0.0f;
-    cam.jumping = 0;
+        /* Camera starting position -- only meaningful once gameplay
+         * actually begins, but harmless to set up now. */
+        cam.x = (MAP_W * 0.5f);
+        cam.z = (MAP_ROWS * 0.5f);
+        cam.y = EYE_HEIGHT;
+        cam.yaw = 0.0f;
+        cam.pitch = 0.0f;
+        cam.vel_y = 0.0f;
+        cam.jumping = 0;
 
-    last_time = portable_time();
+        last_time = portable_time();
 
-    printf("[main] Entering render loop. WASD/mouse or arrows to move+look,\n"
-           "       Space to jump, left mouse button or E to shoot, ESC to quit.\n");
-    while (g_running) {
-        double now = portable_time();
-        f32 dt = (f32)(now - last_time);
-        last_time = now;
-        if (dt > 0.1f) dt = 0.1f;
+        printf("[main] Entering menu. Up/Down to select, E to confirm.\n");
+        while (g_running) {
+            double now = portable_time();
+            f32 dt = (f32)(now - last_time);
+            last_time = now;
+            if (dt > 0.1f) dt = 0.1f;
 
-        for (;;) {
-            int type = SCREEN_EVENT_NONE;
-            if (screen_get_event(screen_ctx, screen_ev, 0) != 0) break;
-            screen_get_event_property_iv(screen_ev, SCREEN_PROPERTY_TYPE, &type);
-            if (type == SCREEN_EVENT_NONE) break;
+            for (;;) {
+                int type = SCREEN_EVENT_NONE;
+                if (screen_get_event(screen_ctx, screen_ev, 0) != 0) break;
+                screen_get_event_property_iv(screen_ev, SCREEN_PROPERTY_TYPE, &type);
+                if (type == SCREEN_EVENT_NONE) break;
 
-            if (type == SCREEN_EVENT_KEYBOARD) handle_keyboard_event(screen_ev, &cam);
-            else if (type == SCREEN_EVENT_POINTER) handle_pointer_event(screen_ev, &cam);
+                if (type == SCREEN_EVENT_KEYBOARD) handle_keyboard_event(screen_ev, &cam);
+                else if (type == SCREEN_EVENT_POINTER) handle_pointer_event(screen_ev, &cam);
+            }
+
+            if (g_app_state == APP_STATE_MENU) {
+                if (g_menu_nav_up_requested) {
+                    g_menu_nav_up_requested = 0;
+                    menu_selection = (menu_selection + MENU_OPTION_COUNT - 1) % MENU_OPTION_COUNT;
+                }
+                if (g_menu_nav_down_requested) {
+                    g_menu_nav_down_requested = 0;
+                    menu_selection = (menu_selection + 1) % MENU_OPTION_COUNT;
+                }
+                if (g_menu_confirm_requested) {
+                    g_menu_confirm_requested = 0;
+                    if (menu_selection == MENU_OPTION_QUIT) {
+                        g_running = 0;
+                    } else {
+                        g_connect_mode = (menu_selection == MENU_OPTION_SOLO)
+                            ? CONNECT_MODE_SOLO : CONNECT_MODE_COOP;
+
+                        /* Fresh camera + input state entering gameplay --
+                         * matters both for a first play and for a
+                         * restart after returning from a previous
+                         * session (see the return-to-menu handling
+                         * below, which intentionally does NOT reset
+                         * these, so this is the one place it happens). */
+                        cam.x = (MAP_W * 0.5f);
+                        cam.z = (MAP_ROWS * 0.5f);
+                        cam.y = EYE_HEIGHT;
+                        cam.yaw = 0.0f;
+                        cam.pitch = 0.0f;
+                        cam.vel_y = 0.0f;
+                        cam.jumping = 0;
+                        g_key_w = g_key_a = g_key_s = g_key_d = 0;
+                        g_key_look_left = g_key_look_right = 0;
+                        g_key_look_up = g_key_look_down = 0;
+                        g_key_e = g_key_space = 0;
+                        g_mouse_left_down = 0;
+                        g_have_last_pointer = 0;
+
+                        g_connected = 0;
+                        g_my_id     = 0xFF;
+                        g_net_thread_running = 1;
+                        if (start_net_thread_with_scheduling(&net_tid) != 0) {
+                            fprintf(stderr, "Continuing without networking\n");
+                            g_net_thread_running = 0;
+                        } else {
+                            net_thread_started = 1;
+                        }
+
+                        g_app_state = APP_STATE_PLAYING;
+                        printf("[main] Entering gameplay.\n");
+                    }
+                }
+
+                if (g_running) {
+                    VertexList menu_geo = build_menu_geometry(win_w, win_h, menu_selection);
+                    Mat4 identity = mat4_identity();
+
+                    glViewport(0, 0, win_w, win_h);
+                    glClearColor(0.05f, 0.05f, 0.07f, 1.0f);
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                    glUseProgram(prog);
+                    glDisable(GL_DEPTH_TEST);
+                    glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, identity.m);
+                    if (menu_geo.count > 0) {
+                        glBindBuffer(GL_ARRAY_BUFFER, hud_vbo);
+                        glBufferData(GL_ARRAY_BUFFER,
+                                    (GLsizeiptr)(sizeof(GeoVertex) * (size_t)menu_geo.count),
+                                    menu_geo.verts, GL_DYNAMIC_DRAW);
+                        draw_vertex_list(hud_vbo, pos_loc, color_loc, menu_geo.count);
+                    }
+                    vertex_list_free(&menu_geo);
+                    glEnable(GL_DEPTH_TEST);
+
+                    eglSwapBuffers(egl_disp, egl_surf);
+                }
+                continue;   /* skip the gameplay branch below this frame */
+            }
+
+            /* ---- APP_STATE_PLAYING ---- */
+            if (g_return_to_menu_requested) {
+                g_return_to_menu_requested = 0;
+
+                g_net_thread_running = 0;
+                if (net_thread_started) {
+                    pthread_join(net_tid, NULL);
+                    net_thread_started = 0;
+                }
+
+                /* Clear the shared snapshot so a stale zombie/player
+                 * from the last session doesn't flash on screen for a
+                 * frame before the next PktState arrives. */
+                pthread_mutex_lock(&g_state.lock);
+                g_state.player_count = 0;
+                g_state.zombie_count = 0;
+                g_state.pickup_count = 0;
+                g_state.has_my_state = 0;
+                pthread_mutex_unlock(&g_state.lock);
+
+                g_app_state = APP_STATE_MENU;
+                printf("[main] Returning to menu.\n");
+                continue;   /* menu renders itself next iteration */
+            }
+
+            update_camera(&cam, dt);
+            reconcile_camera(&cam);
+
+            {
+                Mat4 proj = mat4_perspective(70.0f * 3.14159265f / 180.0f,
+                                            (f32)win_w / (f32)win_h, 0.1f, 100.0f);
+                Mat4 view = mat4_view_from_yaw_pitch(cam.x, cam.y, cam.z, cam.yaw, cam.pitch);
+                Mat4 mvp  = mat4_multiply(proj, view);
+                Mat4 identity = mat4_identity();
+
+                VertexList entity_geo = build_entity_geometry();
+                VertexList hud_geo    = build_hud_geometry(win_w, win_h);
+
+                glViewport(0, 0, win_w, win_h);
+                glClearColor(0.02f, 0.02f, 0.03f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                glUseProgram(prog);
+
+                /* 3D pass: level (static) + entities (rebuilt this frame) */
+                glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, mvp.m);
+                draw_vertex_list(level_vbo, pos_loc, color_loc, level_vertex_count);
+
+                if (entity_geo.count > 0) {
+                    glBindBuffer(GL_ARRAY_BUFFER, entity_vbo);
+                    glBufferData(GL_ARRAY_BUFFER,
+                                (GLsizeiptr)(sizeof(GeoVertex) * (size_t)entity_geo.count),
+                                entity_geo.verts, GL_DYNAMIC_DRAW);
+                    draw_vertex_list(entity_vbo, pos_loc, color_loc, entity_geo.count);
+                }
+                vertex_list_free(&entity_geo);
+
+                /* 2D HUD pass: identity MVP (hud_render.c emits NDC
+                 * directly), depth test off so it always draws on top. */
+                glDisable(GL_DEPTH_TEST);
+                glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, identity.m);
+                if (hud_geo.count > 0) {
+                    glBindBuffer(GL_ARRAY_BUFFER, hud_vbo);
+                    glBufferData(GL_ARRAY_BUFFER,
+                                (GLsizeiptr)(sizeof(GeoVertex) * (size_t)hud_geo.count),
+                                hud_geo.verts, GL_DYNAMIC_DRAW);
+                    draw_vertex_list(hud_vbo, pos_loc, color_loc, hud_geo.count);
+                }
+                vertex_list_free(&hud_geo);
+                glEnable(GL_DEPTH_TEST);   /* restore for next frame's 3D pass */
+            }
+
+            eglSwapBuffers(egl_disp, egl_surf);
         }
 
-        update_camera(&cam, dt);
-        reconcile_camera(&cam);
-
-        {
-            Mat4 proj = mat4_perspective(70.0f * 3.14159265f / 180.0f,
-                                        (f32)win_w / (f32)win_h, 0.1f, 100.0f);
-            Mat4 view = mat4_view_from_yaw_pitch(cam.x, cam.y, cam.z, cam.yaw, cam.pitch);
-            Mat4 mvp  = mat4_multiply(proj, view);
-            Mat4 identity = mat4_identity();
-
-            VertexList entity_geo = build_entity_geometry();
-            VertexList hud_geo    = build_hud_geometry(win_w, win_h);
-
-            glViewport(0, 0, win_w, win_h);
-            glClearColor(0.02f, 0.02f, 0.03f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-            glUseProgram(prog);
-
-            /* 3D pass: level (static) + entities (rebuilt this frame) */
-            glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, mvp.m);
-            draw_vertex_list(level_vbo, pos_loc, color_loc, level_vertex_count);
-
-            if (entity_geo.count > 0) {
-                glBindBuffer(GL_ARRAY_BUFFER, entity_vbo);
-                glBufferData(GL_ARRAY_BUFFER,
-                            (GLsizeiptr)(sizeof(GeoVertex) * (size_t)entity_geo.count),
-                            entity_geo.verts, GL_DYNAMIC_DRAW);
-                draw_vertex_list(entity_vbo, pos_loc, color_loc, entity_geo.count);
-            }
-            vertex_list_free(&entity_geo);
-
-            /* 2D HUD pass: identity MVP (hud_render.c emits NDC
-             * directly), depth test off so it always draws on top. */
-            glDisable(GL_DEPTH_TEST);
-            glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, identity.m);
-            if (hud_geo.count > 0) {
-                glBindBuffer(GL_ARRAY_BUFFER, hud_vbo);
-                glBufferData(GL_ARRAY_BUFFER,
-                            (GLsizeiptr)(sizeof(GeoVertex) * (size_t)hud_geo.count),
-                            hud_geo.verts, GL_DYNAMIC_DRAW);
-                draw_vertex_list(hud_vbo, pos_loc, color_loc, hud_geo.count);
-            }
-            vertex_list_free(&hud_geo);
-            glEnable(GL_DEPTH_TEST);   /* restore for next frame's 3D pass */
-        }
-
-        eglSwapBuffers(egl_disp, egl_surf);
+        g_running = 0;
+        g_net_thread_running = 0;
+        if (net_thread_started)
+            pthread_join(net_tid, NULL);
+        pthread_mutex_destroy(&g_state.lock);
     }
-
-    g_running = 0;
-    pthread_join(net_tid, NULL);
-    pthread_mutex_destroy(&g_state.lock);
 
     eglMakeCurrent(egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroySurface(egl_disp, egl_surf);

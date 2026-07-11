@@ -93,7 +93,11 @@
  * height relative to the platform mesh the client actually drew. */
 #define PLATFORM_HEIGHT   2.0f
 #define RAMP_MID_HEIGHT   (PLATFORM_HEIGHT * 0.5f)
-#define ZOMBIE_CLIMB_SPEED 1.0f   /* height units/sec, both up and down */
+/* COUPLING: mirrors qnx_client's CLIMB_SPEED_UP/DOWN in main.c, so
+ * zombies feel the same "weight" as the player -- falling faster
+ * than rising, rather than floating at a uniform rate either way. */
+#define ZOMBIE_CLIMB_SPEED_UP   3.0f
+#define ZOMBIE_CLIMB_SPEED_DOWN 8.0f
 
 #define SPAWN_COUNT 4
 static const f32 SPAWN_X[SPAWN_COUNT] = { 2.5f, 21.5f,  2.5f, 21.5f };
@@ -574,25 +578,27 @@ static void recv_packets(void)
 /* ------------------------------------------------------------------ */
 
 /* Moves z toward whatever height the tile under the zombie's feet
- * implies, at a constant rate -- see the ZOMBIE_CLIMB_SPEED COUPLING
+ * implies, at asymmetric rates (falling faster than climbing, for a
+ * "weight" feel) -- see the ZOMBIE_CLIMB_SPEED_UP/DOWN COUPLING
  * WARNING above for why this is an approximation rather than a true
  * ramp-slope trace. */
 static void zombie_height_tick(ServerZombie *z)
 {
     int tile = map_tile((int)z->x, (int)z->y);
     f32 target_z;
-    f32 step;
+    f32 step_up, step_down;
 
     if (tile == TILE_PLATFORM)      target_z = PLATFORM_HEIGHT;
     else if (tile == TILE_RAMP)     target_z = RAMP_MID_HEIGHT;
     else                            target_z = 0.0f;
 
-    step = ZOMBIE_CLIMB_SPEED / (f32)NET_TICK_RATE;
+    step_up   = ZOMBIE_CLIMB_SPEED_UP   / (f32)NET_TICK_RATE;
+    step_down = ZOMBIE_CLIMB_SPEED_DOWN / (f32)NET_TICK_RATE;
     if (z->z < target_z) {
-        z->z += step;
+        z->z += step_up;
         if (z->z > target_z) z->z = target_z;
     } else if (z->z > target_z) {
-        z->z -= step;
+        z->z -= step_down;
         if (z->z < target_z) z->z = target_z;
     }
 }
@@ -728,7 +734,7 @@ int main(int argc, char **argv)
     if (g_sock < 0) return 1;
     if (net_bind(g_sock, port) < 0) return 1;
 
-    printf("qnx-game-server  port=%d  tick_rate=%d Hz\n",
+    printf("doom-qnx-coop server  port=%d  tick_rate=%d Hz\n",
            port, NET_TICK_RATE);
 
     double tick_interval = 1.0 / NET_TICK_RATE;

@@ -1,5 +1,5 @@
 /*
- * level_geo.c
+ * level_geo.c -- see level_geo.h for the overview.
  */
 
 #include "level_geo.h"
@@ -13,7 +13,7 @@
 
 #define TILE_SIZE          1.0f
 #define WALL_HEIGHT        4.0f
-#define PLATFORM_HEIGHT    2.0f
+#define PLATFORM_HEIGHT    LEVEL_PLATFORM_HEIGHT
 #define PLATFORM_THICKNESS 0.25f
 #define RAMP_THICKNESS     0.3f
 
@@ -38,9 +38,12 @@ void vertex_list_free(VertexList *vl)
     vl->count = vl->capacity = 0;
 }
 
-/* Face indices shared by both box helpers below: 6 faces, 2 corners
+/* Face indices shared by both box helpers below -- 6 faces, 2 corners
  * of a diagonal each (a,b,c,d) forming two triangles (a,b,c) and
- * (a,c,d). */
+ * (a,c,d). Face culling is left disabled in main.c specifically so
+ * winding order here doesn't matter -- every face renders regardless
+ * of which way it winds, trading a little GPU efficiency for one
+ * fewer thing that could silently break unverified. */
 static const int FACES[6][4] = {
     {0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {3,2,6,7}, {4,5,1,0},
 };
@@ -132,32 +135,40 @@ static int chain_walkable(int mx, int my)
     return t == 0 || t == TILE_RAMP || t == TILE_PLATFORM;
 }
 
-static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
+/* Finds the full straight ramp chain that (query_mx, query_my) is
+ * part of (that tile must already be known to be TILE_RAMP). Walks
+ * backward to the true low end regardless of which tile in the chain
+ * the query started from, then collects the whole chain low-to-high
+ * into chain_mx/chain_my (caller-provided arrays, size >= 24).
+ * Returns the chain length, or 0 if it doesn't run straight from open
+ * floor to a platform tile (caller should fall back to flat-ground
+ * behavior in that case). If out_index is non-NULL, it's set to the
+ * query tile's position within the returned chain (0 = lowest end).
+ * If out_dx/out_dy are non-NULL, they're set to the chain's walk
+ * direction (always exactly one of them 1 and the other 0) -- needed
+ * by build_ramp_chain() to orient the ramp mesh, not by
+ * level_exact_ramp_height() which only needs the index.
+ *
+ * Shared by build_ramp_chain() (mesh generation) and
+ * level_exact_ramp_height() (the camera's height query) so there is
+ * exactly one implementation of "what chain is this tile part of" --
+ * the two were drifting apart before this refactor, which is
+ * precisely what caused the camera to float instead of climbing
+ * smoothly: it was using a flat guess instead of this real answer. */
+static int find_ramp_chain(int query_mx, int query_my, int chain_mx[], int chain_my[],
+                           int *out_index, int *out_dx, int *out_dy)
 {
-    int horiz_ok = chain_walkable(start_mx - 1, start_my) && chain_walkable(start_mx + 1, start_my);
-    int vert_ok  = chain_walkable(start_mx, start_my - 1) && chain_walkable(start_mx, start_my + 1);
+    int horiz_ok = chain_walkable(query_mx - 1, query_my) && chain_walkable(query_mx + 1, query_my);
+    int vert_ok  = chain_walkable(query_mx, query_my - 1) && chain_walkable(query_mx, query_my + 1);
     int dx = 0, dy = 0;
     int lo_mx, lo_my, cx, cy, n, i;
-    int chain_mx[24], chain_my[24];   /* MAP_W/MAP_ROWS are both 24; a
-                                        * chain can't be longer than the
-                                        * map is wide/tall */
     int before_tile, after_tile;
-    f32 step;
 
-    if (horiz_ok) {
-        dx = 1;
-    } else if (vert_ok) {
-        dy = 1;
-    } else {
-        fprintf(stderr, "[level] Ramp at (%d,%d) isn't part of a straight "
-                        "chain -- skipping. Needs open floor on one end "
-                        "and a platform tile on the other, in a line.\n",
-                start_mx, start_my);
-        g_ramp_visited[start_my][start_mx] = 1;
-        return;
-    }
+    if (horiz_ok) dx = 1;
+    else if (vert_ok) dy = 1;
+    else return 0;
 
-    lo_mx = start_mx; lo_my = start_my;
+    lo_mx = query_mx; lo_my = query_my;
     while (map_tile(lo_mx - dx, lo_my - dy) == TILE_RAMP) {
         lo_mx -= dx; lo_my -= dy;
     }
@@ -172,14 +183,35 @@ static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
 
     before_tile = map_tile(lo_mx - dx, lo_my - dy);
     after_tile  = map_tile(cx, cy);
-    for (i = 0; i < n; i++) g_ramp_visited[chain_my[i]][chain_mx[i]] = 1;
+    if (before_tile != 0 || after_tile != TILE_PLATFORM) return 0;
 
-    if (before_tile != 0 || after_tile != TILE_PLATFORM) {
-        fprintf(stderr, "[level] Ramp chain at (%d,%d) doesn't run from "
-                        "open floor to a platform tile in a straight "
-                        "line -- skipping.\n", start_mx, start_my);
+    if (out_index) {
+        *out_index = -1;
+        for (i = 0; i < n; i++) {
+            if (chain_mx[i] == query_mx && chain_my[i] == query_my) { *out_index = i; break; }
+        }
+    }
+    if (out_dx) *out_dx = dx;
+    if (out_dy) *out_dy = dy;
+    return n;
+}
+
+static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
+{
+    int chain_mx[24], chain_my[24];
+    int dx = 0, dy = 0;
+    int n = find_ramp_chain(start_mx, start_my, chain_mx, chain_my, NULL, &dx, &dy);
+    int i;
+    f32 step;
+
+    if (n == 0) {
+        fprintf(stderr, "[level] Ramp at (%d,%d) isn't part of a straight "
+                        "chain from open floor to a platform tile -- "
+                        "skipping.\n", start_mx, start_my);
+        g_ramp_visited[start_my][start_mx] = 1;
         return;
     }
+    for (i = 0; i < n; i++) g_ramp_visited[chain_my[i]][chain_mx[i]] = 1;
     if (n < 3) {
         fprintf(stderr, "[level] Ramp chain at (%d,%d) is only %d tile(s) "
                         "-- likely steeper than a comfortable walkable "
@@ -215,6 +247,31 @@ static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
         world = mat4_multiply(mat4_translate(center_x, center_y, center_z), rot);
         push_box_transformed(vl, world, hx, hy, hz, 0.5f, 0.4f, 0.25f);
     }
+}
+
+/* The camera's CONTINUOUS height while standing on a ramp, computed
+ * from its exact fractional position along the chain -- not a
+ * per-tile step. This is the actual fix for "have to climb slowly":
+ * the old version (level_height_for_tile returning one value per
+ * whole tile) still needed an eased transition between tiles, and
+ * that easing could only keep up with the target if you crossed each
+ * tile slower than the ease rate. A continuous function has nothing
+ * to catch up to -- the camera can snap directly to it every frame
+ * (see update_camera in main.c) regardless of movement speed. */
+f32 level_continuous_ramp_height(f32 x, f32 y)
+{
+    int mx = (int)x, my = (int)y;
+    int chain_mx[24], chain_my[24], index = -1, dx = 0, dy = 0;
+    int n = find_ramp_chain(mx, my, chain_mx, chain_my, &index, &dx, &dy);
+    f32 frac;
+
+    if (n <= 0 || index < 0) return PLATFORM_HEIGHT * 0.5f;   /* malformed chain -- flat fallback */
+
+    frac = (dx != 0) ? (x - (f32)chain_mx[0]) : (y - (f32)chain_my[0]);
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > (f32)n) frac = (f32)n;
+
+    return (frac / (f32)n) * PLATFORM_HEIGHT;
 }
 
 /* ------------------------------------------------------------------ */
@@ -279,6 +336,6 @@ f32 level_height_for_tile(int mx, int my)
 {
     int t = map_tile(mx, my);
     if (t == TILE_PLATFORM) return PLATFORM_HEIGHT;
-    if (t == TILE_RAMP)     return PLATFORM_HEIGHT * 0.5f;
+    if (t == TILE_RAMP)     return level_continuous_ramp_height((f32)mx + 0.5f, (f32)my + 0.5f);
     return 0.0f;
 }
