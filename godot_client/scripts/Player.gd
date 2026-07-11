@@ -77,7 +77,7 @@ func _physics_process(delta: float) -> void:
 		_send_accum = 0.0
 		var f3: Vector3 = -global_transform.basis.z
 		var server_angle := atan2(f3.z, f3.x)
-		Network.send_input(fwd, back, left, right, server_angle, shoot_held)
+		Network.send_input(fwd, back, left, right, server_angle, shoot_held, pitch)
 
 func _on_state_updated() -> void:
 	if not Network.players.has(Network.my_id):

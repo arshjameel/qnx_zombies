@@ -18,28 +18,40 @@
 #include <arpa/inet.h>
 
 /* ------------------------------------------------------------------ */
-/* Game constants                                                       */
+/* Game constants                                                       */ayy
 /* ------------------------------------------------------------------ */
 #define MOVE_SPEED      0.05f
 #define SHOOT_DAMAGE    25
 #define SHOOT_RANGE     10.0f
 #define AMMO_MAX        30
-#define RESPAWN_TICKS   (NET_TICK_RATE * 3)   // 3 seconds
+#define RESPAWN_TICKS   (NET_TICK_RATE * 3)   /* 3 seconds */
 
 #define ZOMBIE_SPEED              0.025f
 #define ZOMBIE_HEALTH             50
 #define ZOMBIE_DAMAGE             10
 #define ZOMBIE_ATTACK_RANGE       0.8f
-#define ZOMBIE_ATTACK_COOLDOWN    (NET_TICK_RATE * 1)  // 1 attack/sec
+#define ZOMBIE_ATTACK_COOLDOWN    (NET_TICK_RATE * 1)  /* 1 attack/sec */
 #define WAVE_BASE_ZOMBIES         3
 #define WAVE_ZOMBIE_INCREMENT     2
+
+/* Head/body hitbox split
+ * given the shooter's eye height, vertical
+ * aim (pitch), and horizontal distance to the target (already known
+ * from shoot_check's cone test), we compute where a straight line at
+ * that pitch would cross the target's vertical column, then classify
+ * that height against the zombie's head/body split.
+ */
+#define PLAYER_EYE_HEIGHT   1.4f
+#define ZOMBIE_HEIGHT        1.8f
+#define HEAD_ZONE_FRACTION   0.25f   /* top quarter of ZOMBIE_HEIGHT is head */
+#define HEADSHOT_DAMAGE       999    /* instakill; clamped to health below */
 
 #define SPAWN_COUNT 4
 static const f32 SPAWN_X[SPAWN_COUNT] = { 2.5f, 21.5f,  2.5f, 21.5f };
 static const f32 SPAWN_Y[SPAWN_COUNT] = { 2.5f,  2.5f, 21.5f, 21.5f };
 static const f32 SPAWN_A[SPAWN_COUNT] = { 0.0f,  3.14f,  1.57f, 4.71f };
 
-/* zombie spawn points spread across the middle of the map and away from player spawn corners. */
+/* Zombie spawn points */
 #define ZOMBIE_SPAWN_COUNT 8
 static const f32 ZOMBIE_SPAWN_X[ZOMBIE_SPAWN_COUNT] =
     { 8.5f, 15.5f, 4.5f, 12.5f, 19.5f, 8.5f, 15.5f, 12.5f };
@@ -63,6 +75,7 @@ typedef struct {
     u8                 inp_strafe_l;
     u8                 inp_strafe_r;
     f32                inp_look_angle;
+    f32                inp_pitch;
     u8                 inp_shoot;
     u8                 inp_shoot_prev;
 } ServerPlayer;
@@ -82,7 +95,7 @@ static int          g_sock = -1;
 static u32          g_tick = 0;
 
 /* ------------------------------------------------------------------ */
-/* Helper functions                                                     */
+/* Helpers                                                              */
 /* ------------------------------------------------------------------ */
 static double mono_time(void)
 {
@@ -163,31 +176,69 @@ static void spawn_wave(void)
     printf("Wave %d started: %d zombies\n", g_wave, spawned);
 }
 
-/* Hitscan 
+/* Hitscan
  * return id of nearest alive zombie in shooter's forward cone 
  * or -1 if no zombie in that cone 
+ *
+ * project the zombie's position onto the aim ray to find the closest approach
+ * point, then check how far off that ray the zombie actually is
+ * (perpendicular distance) against its real radius, i.e. does the
+ * crosshair overlap the model, the same way a normal hitscan weapon works.y
  */
+#define ZOMBIE_RADIUS 0.35f
+
 static int shoot_check(int shooter_id)
 {
     ServerPlayer *sh = &g_players[shooter_id];
     f32 rx = cosf(sh->angle);
     f32 ry = sinf(sh->angle);
-    f32 best = SHOOT_RANGE;
+    f32 best = SHOOT_RANGE;   /* tracks closest qualifying hit, along the ray */
     int hit  = -1;
     int i;
 
     for (i = 0; i < MAX_ZOMBIES; i++) {
         if (!g_zombies[i].active || !g_zombies[i].alive) continue;
-        f32 dx   = g_zombies[i].x - sh->x;
-        f32 dy   = g_zombies[i].y - sh->y;
-        f32 dist = sqrtf(dx*dx + dy*dy);
-        if (dist >= best) continue;
-        f32 dot  = (dx/dist)*rx + (dy/dist)*ry;
-        if (dot < 0.9f) continue;   // ~26 degree half angle cone
-        best = dist;
+        f32 dx = g_zombies[i].x - sh->x;
+        f32 dy = g_zombies[i].y - sh->y;
+
+        /* proj = how far along the aim ray the zombie's closest
+         * approach point is. Negative means it's behind the shooter. */
+        f32 proj = dx*rx + dy*ry;
+        if (proj <= 0.0f || proj >= best) continue;
+
+        /* perp = how far off the ray (off-crosshair) the zombie
+         * actually is at that closest approach point. */
+        f32 dist_sq = dx*dx + dy*dy;
+        f32 perp_sq = dist_sq - proj*proj;
+        if (perp_sq < 0.0f) perp_sq = 0.0f;   /* guard tiny float error */
+        if (perp_sq > ZOMBIE_RADIUS * ZOMBIE_RADIUS) continue;
+
+        best = proj;
         hit  = i;
     }
     return hit;
+}
+
+/* Classify a confirmed hit (from shoot_check) as head or
+ * body, using the shooter's vertical aim and horizontal distance to
+ * the target.
+ */
+static int classify_headshot(int shooter_id, int zombie_id)
+{
+    ServerPlayer *sh = &g_players[shooter_id];
+    ServerZombie *z  = &g_zombies[zombie_id];
+    f32 dx   = z->x - sh->x;
+    f32 dy   = z->y - sh->y;
+    f32 dist = sqrtf(dx*dx + dy*dy);
+
+    /* Where a straight line at the shooter's pitch crosses the
+     * target's vertical column, relative to the floor. */
+    f32 hit_y = PLAYER_EYE_HEIGHT + dist * tanf(sh->inp_pitch);
+    if (hit_y < 0.0f)          hit_y = 0.0f;
+    if (hit_y > ZOMBIE_HEIGHT) hit_y = ZOMBIE_HEIGHT;
+
+    f32 head_threshold = ZOMBIE_HEIGHT * (1.0f - HEAD_ZONE_FRACTION);
+    return (hit_y >= head_threshold) ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -258,7 +309,7 @@ static void broadcast_state(void)
     broadcast(&pkt, sizeof(pkt));
 }
 
-static void broadcast_hit(u8 victim_id, u8 victim_type, u8 attacker_id, u8 damage)
+static void broadcast_hit(u8 victim_id, u8 victim_type, u8 attacker_id, u8 damage, u8 headshot)
 {
     PktHit pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -268,6 +319,7 @@ static void broadcast_hit(u8 victim_id, u8 victim_type, u8 attacker_id, u8 damag
     pkt.victim_type  = victim_type;
     pkt.attacker_id  = attacker_id;
     pkt.damage       = damage;
+    pkt.headshot     = headshot;
     broadcast(&pkt, sizeof(pkt));
 }
 
@@ -313,6 +365,7 @@ static void recv_packets(void)
             g_players[id].inp_strafe_l   = inp->strafe_left;
             g_players[id].inp_strafe_r   = inp->strafe_right;
             g_players[id].inp_look_angle = inp->look_angle;
+            g_players[id].inp_pitch      = inp->pitch;
             g_players[id].inp_shoot      = inp->shoot;
             break;
         }
@@ -368,7 +421,7 @@ static void zombie_tick(void)
             ServerPlayer *pl = &g_players[target];
             u8 dmg = ZOMBIE_DAMAGE;
             pl->health = (pl->health > dmg) ? pl->health - dmg : 0;
-            broadcast_hit((u8)target, ENTITY_PLAYER, ATTACKER_ZOMBIE, dmg);
+            broadcast_hit((u8)target, ENTITY_PLAYER, ATTACKER_ZOMBIE, dmg, 0);
             if (pl->health == 0) {
                 pl->alive         = 0;
                 pl->respawn_timer = RESPAWN_TICKS;
@@ -414,19 +467,23 @@ static void game_tick(void)
         if (p->inp_strafe_l) player_move(p,  sinf(p->angle)*MOVE_SPEED, -cosf(p->angle)*MOVE_SPEED);
         if (p->inp_strafe_r) player_move(p, -sinf(p->angle)*MOVE_SPEED,  cosf(p->angle)*MOVE_SPEED);
 
-        /* Rising-edge shoot */
+        /* Rising-edge shoot -- zombies only, no PvP */
         if (p->inp_shoot && !p->inp_shoot_prev && p->ammo > 0) {
             p->ammo--;
             int hit = shoot_check(i);
             if (hit >= 0) {
-                u8 dmg = SHOOT_DAMAGE;
-                ServerZombie *z = &g_zombies[hit];
+                ServerZombie *z    = &g_zombies[hit];
+                int headshot       = classify_headshot(i, hit);
+                u32 raw_dmg        = headshot ? HEADSHOT_DAMAGE : SHOOT_DAMAGE;
+                u8  dmg            = (raw_dmg > 255u) ? 255u : (u8)raw_dmg;  /* wire field is one byte */
+
                 z->health = (z->health > dmg) ? z->health - dmg : 0;
-                broadcast_hit((u8)hit, ENTITY_ZOMBIE, (u8)i, dmg);
+                broadcast_hit((u8)hit, ENTITY_ZOMBIE, (u8)i, dmg, (u8)headshot);
                 if (z->health == 0) {
                     z->alive  = 0;
                     z->active = 0;
-                    printf("Zombie %d killed by player %d\n", hit, i);
+                    printf("Zombie %d killed by player %d%s\n",
+                           hit, i, headshot ? " (HEADSHOT)" : "");
                 }
             }
         }

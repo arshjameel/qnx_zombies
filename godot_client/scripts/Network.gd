@@ -15,17 +15,17 @@ const ENTITY_PLAYER   := 0
 const ENTITY_ZOMBIE    := 1
 const ATTACKER_ZOMBIE := 0xFF
 
-# ---- fixed struct sizes must match the structs in net.h exactly by the bytes ----
+# ---- fixed struct sizes, in bytes (must match net.h exactly) ----
 const HEADER_SIZE       := 6    # u8 + u8 + u32
-const ACCEPT_SIZE       := HEADER_SIZE + 1 + 4 + 4 + 4          # 19
-const INPUT_SIZE        := HEADER_SIZE + 1 + 1 + 1 + 1 + 4 + 1  # 15
-const PLAYER_STATE_SIZE := 1 + 1 + 4 + 4 + 4 + 1 + 1            # 16
-const ZOMBIE_STATE_SIZE := 1 + 1 + 4 + 4 + 1                    # 11
-const HIT_SIZE           := HEADER_SIZE + 1 + 1 + 1 + 1          # 10
+const ACCEPT_SIZE       := HEADER_SIZE + 1 + 4 + 4 + 4              # 19
+const INPUT_SIZE        := HEADER_SIZE + 1 + 1 + 1 + 1 + 4 + 1 + 4  # 19
+const PLAYER_STATE_SIZE := 1 + 1 + 4 + 4 + 4 + 1 + 1                # 16
+const ZOMBIE_STATE_SIZE := 1 + 1 + 4 + 4 + 1                        # 11
+const HIT_SIZE           := HEADER_SIZE + 1 + 1 + 1 + 1 + 1          # 11
 
 signal connected(my_id: int, spawn_x: float, spawn_y: float, spawn_angle: float)
 signal state_updated()
-signal hit_event(victim_id: int, victim_type: int, attacker_id: int, damage: int)
+signal hit_event(victim_id: int, victim_type: int, attacker_id: int, damage: int, headshot: bool)
 signal disconnected_from_server()
 
 var my_id: int = -1
@@ -86,7 +86,7 @@ func send_disconnect() -> void:
 
 ## Call once per physics frame while playing.
 func send_input(forward: bool, back: bool, left: bool, right: bool,
-		look_angle: float, shoot: bool) -> void:
+		look_angle: float, shoot: bool, pitch: float) -> void:
 	if not is_connected:
 		return
 	var pba := StreamPeerBuffer.new()
@@ -97,6 +97,7 @@ func send_input(forward: bool, back: bool, left: bool, right: bool,
 	pba.put_u8(1 if right else 0)
 	pba.put_float(look_angle)
 	pba.put_u8(1 if shoot else 0)
+	pba.put_float(pitch)
 	_udp.put_packet(pba.data_array)
 
 func _send_connect() -> void:
@@ -175,7 +176,8 @@ func _poll_incoming() -> void:
 				var victim_type := pba.get_u8()
 				var attacker_id := pba.get_u8()
 				var damage := pba.get_u8()
-				hit_event.emit(victim_id, victim_type, attacker_id, damage)
+				var headshot := pba.get_u8() != 0
+				hit_event.emit(victim_id, victim_type, attacker_id, damage, headshot)
 
 			_:
 				pass  # unknown packet type, ignore

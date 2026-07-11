@@ -71,10 +71,13 @@ func _process(delta: float) -> void:
 	if changed:
 		_rebuild_feed()
 
-func _on_hit_event(victim_id: int, victim_type: int, attacker_id: int, _damage: int) -> void:
+func _on_hit_event(victim_id: int, victim_type: int, attacker_id: int, _damage: int, headshot: bool) -> void:
 	var text := ""
 	if victim_type == Network.ENTITY_ZOMBIE:
-		text = "[color=lightgreen]Player %d hit zombie %d[/color]" % [attacker_id, victim_id]
+		if headshot:
+			text = "[color=orange][b]HEADSHOT[/b] -- Player %d dropped zombie %d[/color]" % [attacker_id, victim_id]
+		else:
+			text = "[color=lightgreen]Player %d hit zombie %d[/color]" % [attacker_id, victim_id]
 	else:
 		if attacker_id == Network.ATTACKER_ZOMBIE:
 			text = "[color=red]Zombie mauled Player %d[/color]" % victim_id
