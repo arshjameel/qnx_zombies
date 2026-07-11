@@ -4,6 +4,16 @@
 #include "common.h"
 #include "map.h"   /* for MAX_PICKUP_SPAWNS -- pickup slots are 1:1 with map markers */
 
+/* ------------------------------------------------------------------ */
+/* Protocol constants                                                   */
+/*                                                                      */
+/* IMPORTANT: this file is the source of truth for the wire protocol.  */
+/* The Godot client (godot_client/scripts/Network.gd) re-implements    */
+/* every one of these structs by hand in GDScript since GDScript can't */
+/* #include a C header. If you change anything here, mirror the change */
+/* in Network.gd's PACK_* constants and its read/write helper funcs,  */
+/* or the client and server will silently desync.                    */
+/* ------------------------------------------------------------------ */
 #define NET_PORT         7777
 #define NET_MAX_PLAYERS  8
 #define NET_TICK_RATE    20        /* server sends state 20x/sec */
@@ -30,10 +40,13 @@
 /* ------------------------------------------------------------------ */
 #define PICKUP_AMMO     0u
 #define PICKUP_HEALTH   1u
+
+/* Sentinel attacker_id meaning "a zombie did this", since real player
+ * ids only ever run 0..NET_MAX_PLAYERS-1 */
 #define ATTACKER_ZOMBIE 0xFFu
 
 /* ------------------------------------------------------------------ */
-/* Packet structures                                                    */
+/* Packet structures (packed, little-endian)                           */
 /* ------------------------------------------------------------------ */
 #pragma pack(push, 1)
 
@@ -41,12 +54,12 @@ typedef struct {
     u8  type;
     u8  player_id;
     u32 tick;
-} PktHeader;                                          
+} PktHeader;                                          /* 6 bytes */
 
 typedef struct {
     PktHeader hdr;
     u8        mode;      /* 0 = coop (shared world), 1 = solo (private world) */
-} PktConnect;                                          
+} PktConnect;                                          /* 7 bytes */
 
 #define CONNECT_MODE_COOP  0u
 #define CONNECT_MODE_SOLO  1u
@@ -57,7 +70,7 @@ typedef struct {
     f32       spawn_x;
     f32       spawn_y;
     f32       spawn_angle;
-} PktAccept;                                           
+} PktAccept;                                           /* 19 bytes */
 
 typedef struct {
     PktHeader hdr;
@@ -65,10 +78,12 @@ typedef struct {
     u8        back;
     u8        strafe_left;
     u8        strafe_right;
-    f32       look_angle;    /* absolute yaw in radians, player mouse-look */
+    f32       look_angle;    /* absolute yaw in radians, client mouse-look */
     u8        shoot;
-    f32       pitch;         /* absolute pitch in radians, +up/-down for headshot vertical classification
-} PktInput;                                            
+    f32       pitch;         /* absolute pitch in radians, +up/-down, for
+                               * headshot vertical classification only --
+                               * NOT used for horizontal targeting/miss */
+} PktInput;                                            /* 19 bytes */
 
 typedef struct {
     u8  player_id;
@@ -78,23 +93,26 @@ typedef struct {
     f32 angle;
     u8  health;
     u8  ammo;
-} PlayerState;                                         
+} PlayerState;                                         /* 16 bytes */
 
 typedef struct {
     u8  zombie_id;
     u8  alive;
     f32 x;
     f32 y;
+    f32 z;      /* height above floor. 0 unless the server has it
+                 * climbing a ramp or standing on a platform -- see
+                 * server.c's zombie_tick() COUPLING WARNING. */
     u8  health;
-} ZombieState;                                         
+} ZombieState;                                         /* 15 bytes */
 
 typedef struct {
-    u8  pickup_id;    /* index into the map's pickup-marker list */
+    u8  pickup_id;    /* index into the map's pickup-marker list, stable */
     u8  type;         /* PICKUP_AMMO or PICKUP_HEALTH */
     u8  active;       /* 0 while on cooldown after being taken */
     f32 x;
     f32 y;
-} PickupState;
+} PickupState;                                         /* 11 bytes */
 
 typedef struct {
     PktHeader   hdr;
@@ -103,18 +121,20 @@ typedef struct {
     u8          zombie_count;
     ZombieState zombies[MAX_ZOMBIES];
     u8          wave;
+    /* Pickups appended at the end on purpose -- keeps every existing
+     * field's offset unchanged for anything still using the old layout. */
     u8          pickup_count;
     PickupState pickups[MAX_PICKUP_SPAWNS];
-} PktState;                    
+} PktState;                    /* 6+1+128+1+240+1+1+(16*11) = 554 bytes fixed */
 
 typedef struct {
     PktHeader hdr;
     u8        victim_id;
-    u8        victim_type;
-    u8        attacker_id;   
+    u8        victim_type;   /* ENTITY_PLAYER or ENTITY_ZOMBIE */
+    u8        attacker_id;   /* player id, or ATTACKER_ZOMBIE  */
     u8        damage;
-    u8        headshot;      
-} PktHit;
+    u8        headshot;      /* 1 if this hit was in the zombie's head zone */
+} PktHit;                                              /* 11 bytes */
 
 #pragma pack(pop)
 
@@ -122,7 +142,10 @@ typedef struct {
 /* Socket helpers                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Create a non-blocking UDP socket. Returns fd >= 0 or -1. */
 int net_udp_socket(void);
+
+/* Bind socket to port (server). Returns 0 or -1. */
 int net_bind(int sock, u16 port);
 
-#endif
+#endif /* NET_H */

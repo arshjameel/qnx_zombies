@@ -1,5 +1,9 @@
 extends Node3D
 class_name RemotePlayer
+## One instance per OTHER connected player (never the local player --
+## that's Player.gd). Purely visual; the server is authoritative for
+## position, we just lerp toward whatever it last reported.
+
 const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
 
 const HEIGHT := 1.6

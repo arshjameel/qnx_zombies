@@ -1,4 +1,4 @@
-# qnx-game -- server-only Makefile
+# qnx-coop-game -- server-only Makefile
 #
 # Targets:
 #   make server              Linux headless server (local testing)
@@ -40,7 +40,8 @@ else
 endif
 
 # ---- Pi deployment settings ----
-# Uses the "qnxpi" alias from ~/.ssh/config
+# Uses the "qnxpi" alias from ~/.ssh/config -- update HostName there
+# when the Pi's IP changes, not here.
 PI_USER := qnxuser
 PI_HOST := qnxpi
 PI_DIR  := /data/home/qnxuser/game

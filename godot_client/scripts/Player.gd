@@ -1,11 +1,30 @@
 extends CharacterBody3D
 class_name Player
+## The locally-controlled player. Position is predicted locally for
+## smooth movement, then gently corrected toward whatever the server
+## says in Network.players[my_id] each state broadcast (same idea as
+## the old client.c dead-reckoning + reconciliation, just via lerp
+## instead of a hard snap so it doesn't look jittery over Wi-Fi).
+
 const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
 
+## COUPLING WARNING: this must stay in sync with src/server.c's
+## MOVE_SPEED, or the server's authoritative position will drift from
+## what this client predicts, and you'll see rubber-banding instead of
+## a clean speed change. PLAYER_SPEED (world units/sec) = MOVE_SPEED
+## (map units/tick) * NET_TICK_RATE (20 ticks/sec).
 const PLAYER_SPEED := 1.0     # world units/sec == server MOVE_SPEED * NET_TICK_RATE
 const PLAYER_HEIGHT := 1.6
 const INPUT_SEND_HZ := 20.0
 const RECONCILE_LERP := 0.35
+
+# Gravity/jump are purely local -- the server has no concept of a Z
+# axis at all (see LevelBuilder.gd's big comment on this), so falling
+# and jumping never get sent over the network. Other players will
+# always see you as a flat capsule at ground level, same limitation
+# as walking up a ramp -- this just fixes "why don't I fall back down".
+const GRAVITY := 9.8
+const JUMP_VELOCITY := 4.5
 
 var camera: Camera3D
 var pitch: float = 0.0
@@ -40,6 +59,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		pitch -= event.relative.y * GameState.mouse_sensitivity * 0.01
 		pitch = clamp(pitch, deg_to_rad(-80), deg_to_rad(80))
 		camera.rotation.x = pitch
+	# Escape (built-in "ui_cancel") quits to the menu -- handled in
+	# Game.gd, which also releases the mouse. Nothing needed here.
 
 func _physics_process(delta: float) -> void:
 	var fwd := false
@@ -67,14 +88,33 @@ func _physics_process(delta: float) -> void:
 
 		velocity.x = dir.x * PLAYER_SPEED
 		velocity.z = dir.z * PLAYER_SPEED
-		velocity.y = 0.0
+
+		if is_on_floor():
+			# Small downward value rather than exactly 0 -- keeps the
+			# character "stuck" to sloped ramps as it descends them,
+			# instead of momentarily leaving the floor at each step.
+			velocity.y = -0.1
+			if Input.is_action_just_pressed("jump"):
+				velocity.y = JUMP_VELOCITY
+		else:
+			velocity.y -= GRAVITY * delta
+
 		move_and_slide()
 	else:
-		velocity = Vector3.ZERO
+		velocity.x = 0.0
+		velocity.z = 0.0
+		if not is_on_floor():
+			velocity.y -= GRAVITY * delta
+		else:
+			velocity.y = 0.0
+		move_and_slide()
 
 	_send_accum += delta
 	if _send_accum >= 1.0 / INPUT_SEND_HZ:
 		_send_accum = 0.0
+		# atan2 of the body's own forward vector -- self-consistent with
+		# whatever convention the server uses, since both derive the
+		# facing purely from cos/sin of the same angle value.
 		var f3: Vector3 = -global_transform.basis.z
 		var server_angle := atan2(f3.z, f3.x)
 		Network.send_input(fwd, back, left, right, server_angle, shoot_held, pitch)

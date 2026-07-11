@@ -1,7 +1,18 @@
 #ifndef QNX_TIME_H
 #define QNX_TIME_H
 
-#if defined(__QNXNTO__) // QNX
+/*
+ * qnx_time.h -- portable monotonic time and millisecond sleep
+ *
+ * QNX:   ClockCycles() + SYSPAGE for time, usleep() for sleep
+ * Linux: clock_gettime(CLOCK_MONOTONIC),   nanosleep() for sleep
+ *
+ * Avoids CLOCK_MONOTONIC on QNX entirely -- its visibility varies
+ * across SDP versions and conflicts with __EXT_* guards.
+ * ClockCycles() and SYSPAGE need no feature-test macros.
+ */
+
+#if defined(__QNXNTO__)
 
 #include <sys/neutrino.h>   /* ClockCycles() */
 #include <sys/syspage.h>    /* SYSPAGE_ENTRY  */
@@ -22,7 +33,7 @@ static void portable_sleep_ms(int ms)
     usleep((unsigned int)ms * 1000u);
 }
 
-#else  // linux
+#else  /* Linux */
 
 #include <time.h>
 
@@ -43,6 +54,6 @@ static void portable_sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
-#endif
+#endif /* __QNXNTO__ */
 
-#endif
+#endif /* QNX_TIME_H */

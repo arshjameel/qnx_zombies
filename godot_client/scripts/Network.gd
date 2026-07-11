@@ -1,8 +1,21 @@
 extends Node
+## Autoload: Network
+##
+## Re-implements src/net.h by hand since GDScript can't #include a C
+## header. Every struct here MUST match the C side byte-for-byte:
+## same field order, same sizes, no padding (the C side uses
+## #pragma pack(push,1)), little-endian (Godot's StreamPeerBuffer
+## defaults to little-endian, which matches ARM/x86 native order).
+##
+## If you change src/net.h, mirror the change here or the client and
+## server will silently desync -- often NOT with a crash, just a
+## connect that quietly never succeeds (PKT_CONNECT growing a `mode`
+## byte did exactly this) or a new field nobody parses.
 
 # ---- protocol constants (mirror net.h) ----
 const NET_MAX_PLAYERS := 8
 const MAX_ZOMBIES := 16
+const MAX_PICKUP_SPAWNS := 16   # must match map.h's MAX_PICKUP_SPAWNS
 
 const PKT_CONNECT    := 0x01
 const PKT_ACCEPT     := 0x02
@@ -15,12 +28,20 @@ const ENTITY_PLAYER   := 0
 const ENTITY_ZOMBIE    := 1
 const ATTACKER_ZOMBIE := 0xFF
 
+const CONNECT_MODE_COOP := 0
+const CONNECT_MODE_SOLO := 1
+
+const PICKUP_AMMO   := 0
+const PICKUP_HEALTH := 1
+
 # ---- fixed struct sizes, in bytes (must match net.h exactly) ----
 const HEADER_SIZE       := 6    # u8 + u8 + u32
+const CONNECT_SIZE      := HEADER_SIZE + 1                          # 7
 const ACCEPT_SIZE       := HEADER_SIZE + 1 + 4 + 4 + 4              # 19
 const INPUT_SIZE        := HEADER_SIZE + 1 + 1 + 1 + 1 + 4 + 1 + 4  # 19
 const PLAYER_STATE_SIZE := 1 + 1 + 4 + 4 + 4 + 1 + 1                # 16
-const ZOMBIE_STATE_SIZE := 1 + 1 + 4 + 4 + 1                        # 11
+const ZOMBIE_STATE_SIZE := 1 + 1 + 4 + 4 + 4 + 1                    # 15
+const PICKUP_STATE_SIZE := 1 + 1 + 1 + 4 + 4                        # 11
 const HIT_SIZE           := HEADER_SIZE + 1 + 1 + 1 + 1 + 1          # 11
 
 signal connected(my_id: int, spawn_x: float, spawn_y: float, spawn_angle: float)
@@ -34,6 +55,7 @@ var is_connected: bool = false
 # Latest authoritative snapshot, keyed by id. Populated from PKT_STATE.
 var players: Dictionary = {}   # id -> {alive, x, y, angle, health, ammo}
 var zombies: Dictionary = {}   # id -> {alive, x, y, health}
+var pickups: Dictionary = {}   # id -> {type, active, x, y}
 var wave: int = 0
 
 var _udp: PacketPeerUDP = PacketPeerUDP.new()
@@ -43,6 +65,7 @@ const CONNECT_RETRY_INTERVAL := 0.5
 const CONNECT_TIMEOUT := 8.0
 var _connect_elapsed: float = 0.0
 var _connecting: bool = false
+var _connect_mode: int = CONNECT_MODE_COOP
 
 func _process(delta: float) -> void:
 	_poll_incoming()
@@ -57,9 +80,13 @@ func _process(delta: float) -> void:
 			_send_connect()
 			_connect_retry_timer = CONNECT_RETRY_INTERVAL
 
-## Call from the menu when the player picks Solo or Coop.
-func begin_connect(ip: String, port: int) -> void:
+## Call from the menu when the player picks Solo or Coop. `mode` should
+## be CONNECT_MODE_SOLO or CONNECT_MODE_COOP -- the server uses it to
+## decide which session (shared world, or this player's own private
+## one) to place the connecting player into.
+func begin_connect(ip: String, port: int, mode: int = CONNECT_MODE_COOP) -> void:
 	reset()
+	_connect_mode = mode
 	var err := _udp.connect_to_host(ip, port)
 	if err != OK:
 		push_warning("Network: connect_to_host failed: %s" % err)
@@ -73,6 +100,7 @@ func reset() -> void:
 	is_connected = false
 	players.clear()
 	zombies.clear()
+	pickups.clear()
 	wave = 0
 	_connecting = false
 
@@ -103,6 +131,7 @@ func send_input(forward: bool, back: bool, left: bool, right: bool,
 func _send_connect() -> void:
 	var pba := StreamPeerBuffer.new()
 	_write_header(pba, PKT_CONNECT, 0)
+	pba.put_u8(_connect_mode)
 	_udp.put_packet(pba.data_array)
 
 func _write_header(pba: StreamPeerBuffer, type: int, player_id: int) -> void:
@@ -160,14 +189,34 @@ func _poll_incoming() -> void:
 					var zalive := pba.get_u8()
 					var zx := pba.get_float()
 					var zy := pba.get_float()
+					var zz := pba.get_float()
 					var zhealth := pba.get_u8()
 					if i < zombie_count:
 						new_zombies[zid] = {
-							"alive": zalive != 0, "x": zx, "y": zy, "health": zhealth,
+							"alive": zalive != 0, "x": zx, "y": zy, "z": zz, "health": zhealth,
 						}
 				wave = pba.get_u8()
+
+				# Pickups -- appended at the end of PktState on the C
+				# side specifically so this is the only new block
+				# needed here; nothing above this point changed shape.
+				var new_pickups := {}
+				if bytes.size() >= HEADER_SIZE + 1 + 1:  # at least room for pickup_count itself
+					var pickup_count := pba.get_u8()
+					for i in range(MAX_PICKUP_SPAWNS):
+						var pkid := pba.get_u8()
+						var ptype := pba.get_u8()
+						var pactive := pba.get_u8()
+						var px := pba.get_float()
+						var py := pba.get_float()
+						if i < pickup_count:
+							new_pickups[pkid] = {
+								"type": ptype, "active": pactive != 0, "x": px, "y": py,
+							}
+
 				players = new_players
 				zombies = new_zombies
+				pickups = new_pickups
 				state_updated.emit()
 
 			PKT_HIT:

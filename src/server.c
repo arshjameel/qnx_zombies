@@ -78,6 +78,23 @@
 #define HEAD_ZONE_FRACTION   0.25f   /* top quarter of ZOMBIE_HEIGHT is head */
 #define HEADSHOT_DAMAGE       50
 
+/* Zombie ramp/platform climbing. This is a deliberate approximation,
+ * not a full port of LevelBuilder.gd's per-tile ramp-chain math: the
+ * server doesn't know which ramp tile is which step of which chain,
+ * it only knows the raw tile type under a zombie's feet right now.
+ * So target height is just "0 on floor, halfway up while anywhere on
+ * a ramp tile, full height on a platform tile", eased toward smoothly
+ * each tick rather than snapped -- looks like climbing/dropping in
+ * practice even though it doesn't trace the exact ramp slope the way
+ * the player's real physics-based climb does.
+ *
+ * COUPLING WARNING: PLATFORM_HEIGHT must match LevelBuilder.gd's
+ * PLATFORM_HEIGHT, or a zombie will visually stand at the wrong
+ * height relative to the platform mesh the client actually drew. */
+#define PLATFORM_HEIGHT   2.0f
+#define RAMP_MID_HEIGHT   (PLATFORM_HEIGHT * 0.5f)
+#define ZOMBIE_CLIMB_SPEED 1.0f   /* height units/sec, both up and down */
+
 #define SPAWN_COUNT 4
 static const f32 SPAWN_X[SPAWN_COUNT] = { 2.5f, 21.5f,  2.5f, 21.5f };
 static const f32 SPAWN_Y[SPAWN_COUNT] = { 2.5f,  2.5f, 21.5f, 21.5f };
@@ -119,6 +136,7 @@ typedef struct {
     int alive;
     u8  session_id;
     f32 x, y;
+    f32 z;              /* height above floor -- see zombie_tick's COUPLING WARNING */
     u8  health;
     int attack_cooldown;
 } ServerZombie;
@@ -230,6 +248,7 @@ static void spawn_wave(u8 session_id)
         g_zombies[i].active          = 1;
         g_zombies[i].alive           = 1;
         g_zombies[i].session_id      = session_id;
+        g_zombies[i].z               = 0.0f;
         g_zombies[i].health          = ZOMBIE_HEALTH;
         g_zombies[i].x               = ZOMBIE_SPAWN_X[i % ZOMBIE_SPAWN_COUNT];
         g_zombies[i].y               = ZOMBIE_SPAWN_Y[i % ZOMBIE_SPAWN_COUNT];
@@ -432,6 +451,7 @@ static void send_state_to_session(u8 session_id)
         zs->alive     = (u8)g_zombies[i].alive;
         zs->x         = g_zombies[i].x;
         zs->y         = g_zombies[i].y;
+        zs->z         = g_zombies[i].z;
         zs->health    = g_zombies[i].health;
     }
     pkt.zombie_count = (u8)zactive;
@@ -552,12 +572,39 @@ static void recv_packets(void)
 /* ------------------------------------------------------------------ */
 /* Zombie AI tick                                                       */
 /* ------------------------------------------------------------------ */
+
+/* Moves z toward whatever height the tile under the zombie's feet
+ * implies, at a constant rate -- see the ZOMBIE_CLIMB_SPEED COUPLING
+ * WARNING above for why this is an approximation rather than a true
+ * ramp-slope trace. */
+static void zombie_height_tick(ServerZombie *z)
+{
+    int tile = map_tile((int)z->x, (int)z->y);
+    f32 target_z;
+    f32 step;
+
+    if (tile == TILE_PLATFORM)      target_z = PLATFORM_HEIGHT;
+    else if (tile == TILE_RAMP)     target_z = RAMP_MID_HEIGHT;
+    else                            target_z = 0.0f;
+
+    step = ZOMBIE_CLIMB_SPEED / (f32)NET_TICK_RATE;
+    if (z->z < target_z) {
+        z->z += step;
+        if (z->z > target_z) z->z = target_z;
+    } else if (z->z > target_z) {
+        z->z -= step;
+        if (z->z < target_z) z->z = target_z;
+    }
+}
+
 static void zombie_tick(void)
 {
     int i, p;
     for (i = 0; i < MAX_ZOMBIES; i++) {
         ServerZombie *z = &g_zombies[i];
         if (!z->active || !z->alive) continue;
+
+        zombie_height_tick(z);
 
         /* find nearest alive player in the SAME session */
         int target = -1;
@@ -681,7 +728,7 @@ int main(int argc, char **argv)
     if (g_sock < 0) return 1;
     if (net_bind(g_sock, port) < 0) return 1;
 
-    printf("doom-qnx-coop server  port=%d  tick_rate=%d Hz\n",
+    printf("qnx-game-server  port=%d  tick_rate=%d Hz\n",
            port, NET_TICK_RATE);
 
     double tick_interval = 1.0 / NET_TICK_RATE;

@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 #if defined(__QNXNTO__)
-#  include <sys/time.h>    /* struct timeval */
+#  include <sys/time.h>    /* struct timeval, SO_RCVTIMEO */
 #  include <sys/types.h>   /* close() on QNX */
 #  include <unistd.h>      /* close() backup */
 #else
@@ -20,6 +20,11 @@ int net_udp_socket(void)
     if (sock < 0) { perror("socket"); return -1; }
 
 #if defined(__QNXNTO__)
+    /*
+     * On QNX use SO_RCVTIMEO instead of O_NONBLOCK.
+     * recvfrom returns EAGAIN immediately when no data is ready,
+     * which is functionally identical for our polling loop.
+     */
     struct timeval tv;
     tv.tv_sec  = 0;
     tv.tv_usec = 1000;   /* 1 ms */

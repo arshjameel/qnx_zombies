@@ -22,8 +22,10 @@ func _ready() -> void:
 	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
 	add_child(bg)
 
+	# Full-width strip pinned to the top, text centered within it --
+	# no guessing at the label's rendered width needed, unlike before.
 	var title := Label.new()
-	title.text = "QNX GAME"
+	title.text = "QNX COOP GAME"
 	title.add_theme_font_size_override("font_size", 48)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	title.set_anchors_preset(Control.PRESET_TOP_WIDE)
@@ -37,6 +39,9 @@ func _ready() -> void:
 
 	_show_panel(_root_wrap)
 
+## Wraps `content` in a CenterContainer anchored to the full rect, so it's
+## always centered in whatever the actual window size turns out to be --
+## no hand-computed pixel offsets, which is what broke last time.
 func _wrap_centered(content: Control) -> CenterContainer:
 	var wrap := CenterContainer.new()
 	wrap.set_anchors_preset(Control.PRESET_FULL_RECT)

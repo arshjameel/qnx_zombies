@@ -2,11 +2,14 @@
 #include <string.h>
 
 /*
- * 24x24 tile map 
- * 0 = floor 
- * 1-4 = wall types 
- * 5 = pickup spawn marker
- * Outer ring is always solid.
+ * 24x24 tile map.  0 = floor, 1-4 = wall types, 5 = pickup spawn marker,
+ * 6 = ramp, 7 = elevated platform (all of 0/5/6/7 are walkable floor --
+ * see map_is_wall). Outer ring is always solid.
+ *
+ * The ramp at row 10 (cols 17-19) climbs up to the 2x2 platform at
+ * rows 9-10, cols 20-21 -- a small worked example of the
+ * ramp-chain-must-be-straight-with-floor-at-one-end-and-platform-at-
+ * the-other rule described in map.h.
  */
 const u8 g_map[MAP_ROWS][MAP_W] = {
     {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
@@ -18,8 +21,8 @@ const u8 g_map[MAP_ROWS][MAP_W] = {
     {1,0,0,0,0,0,2,0,0,0,0,0,0,3,0,0,0,3,0,0,0,0,0,1},
     {1,0,0,0,0,0,2,2,2,0,0,0,0,3,0,0,0,3,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,0,3,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,0,3,3,0,3,3,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,0,0,3,3,0,3,3,0,0,7,7,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,6,6,6,7,7,0,1},
     {1,0,0,5,0,0,0,0,0,0,0,5,0,0,0,0,0,0,0,0,5,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
