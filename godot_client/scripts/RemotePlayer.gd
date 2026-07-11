@@ -1,5 +1,6 @@
 extends Node3D
 class_name RemotePlayer
+const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
 
 const HEIGHT := 1.6
 const LERP_SPEED := 10.0
@@ -21,7 +22,7 @@ func _ready() -> void:
 	add_child(_mesh_inst)
 
 func update_from_state(state: Dictionary) -> void:
-	_target_pos = LevelBuilder.map_to_world(state["x"], state["y"], 0.0)
+	_target_pos = LevelBuilderScript.map_to_world(state["x"], state["y"], 0.0)
 	visible = state["alive"]
 
 func _process(delta: float) -> void:

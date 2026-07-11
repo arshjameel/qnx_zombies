@@ -15,6 +15,7 @@ const ENTITY_PLAYER   := 0
 const ENTITY_ZOMBIE    := 1
 const ATTACKER_ZOMBIE := 0xFF
 
+# ---- fixed struct sizes must match the structs in net.h exactly by the bytes ----
 const HEADER_SIZE       := 6    # u8 + u8 + u32
 const ACCEPT_SIZE       := HEADER_SIZE + 1 + 4 + 4 + 4          # 19
 const INPUT_SIZE        := HEADER_SIZE + 1 + 1 + 1 + 1 + 4 + 1  # 15

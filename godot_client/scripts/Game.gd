@@ -1,11 +1,17 @@
 extends Node3D
 
-var _player: Player = null
+const PlayerScript       := preload("res://scripts/Player.gd")
+const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
+const HUDScript          := preload("res://scripts/HUD.gd")
+const RemotePlayerScript := preload("res://scripts/RemotePlayer.gd")
+const ZombieScript       := preload("res://scripts/Zombie.gd")
+
+var _player: CharacterBody3D = null
 var _remote_players: Dictionary = {}   # id -> RemotePlayer node
 var _zombies: Dictionary = {}          # id -> Zombie node
-var _level: LevelBuilder
+var _level: Node3D
 var _entities_root: Node3D
-var _hud: HUD
+var _hud: CanvasLayer
 
 func _ready() -> void:
 	var env := WorldEnvironment.new()
@@ -23,25 +29,28 @@ func _ready() -> void:
 	sun.light_energy = 0.7
 	add_child(sun)
 
-	_level = LevelBuilder.new()
+	_level = LevelBuilderScript.new()
 	add_child(_level)
 
 	_entities_root = Node3D.new()
 	add_child(_entities_root)
 
-	_hud = HUD.new()
+	_hud = HUDScript.new()
 	add_child(_hud)
 
 	Network.connected.connect(_on_connected)
 	Network.state_updated.connect(_on_state_updated)
 	Network.begin_connect(GameState.server_ip, GameState.server_port)
 
-func _on_connected(my_id: int, spawn_x: float, spawn_y: float, spawn_angle: float) -> void:
+func _on_connected(my_id: int, spawn_x: float, spawn_y: float, _spawn_angle: float) -> void:
 	if _player != null:
 		return
-	_player = Player.new()
+	_player = PlayerScript.new()
 	add_child(_player)
-	_player.global_position = LevelBuilder.map_to_world(spawn_x, spawn_y, 0.0)
+	_player.global_position = LevelBuilderScript.map_to_world(spawn_x, spawn_y, 0.0)
+	# Not bothering to convert spawn_angle into an exact initial yaw --
+	# it's a cosmetic starting facing direction and self-corrects the
+	# instant the player moves the mouse.
 	print("Connected as player %d" % my_id)
 
 func _on_state_updated() -> void:
@@ -55,7 +64,7 @@ func _sync_remote_players() -> void:
 			continue
 		seen[id] = true
 		if not _remote_players.has(id):
-			var rp := RemotePlayer.new()
+			var rp := RemotePlayerScript.new()
 			rp.player_id = id
 			_entities_root.add_child(rp)
 			_remote_players[id] = rp
@@ -71,7 +80,7 @@ func _sync_zombies() -> void:
 	for id in Network.zombies.keys():
 		seen[id] = true
 		if not _zombies.has(id):
-			var z := Zombie.new()
+			var z := ZombieScript.new()
 			z.zombie_id = id
 			_entities_root.add_child(z)
 			_zombies[id] = z

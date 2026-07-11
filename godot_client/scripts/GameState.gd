@@ -1,6 +1,6 @@
 extends Node
 
-var server_ip: String = "10.0.0.46"
+var server_ip: String = "169.254.121.132"
 var server_port: int = 7777
 
 var mouse_sensitivity: float = 0.15

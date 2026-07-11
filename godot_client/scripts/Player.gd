@@ -1,5 +1,6 @@
 extends CharacterBody3D
 class_name Player
+const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
 
 const PLAYER_SPEED := 1.0     # world units/sec == server MOVE_SPEED * NET_TICK_RATE
 const PLAYER_HEIGHT := 1.6
@@ -86,5 +87,5 @@ func _on_state_updated() -> void:
 	health = me["health"]
 	ammo = me["ammo"]
 
-	var target := LevelBuilder.map_to_world(me["x"], me["y"], global_position.y)
+	var target := LevelBuilderScript.map_to_world(me["x"], me["y"], global_position.y)
 	global_position = global_position.lerp(target, RECONCILE_LERP)

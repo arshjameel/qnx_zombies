@@ -1,5 +1,6 @@
 extends Node3D
 class_name Zombie
+const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
 
 const HEIGHT := 1.8
 const LERP_SPEED := 8.0
@@ -22,9 +23,10 @@ func _ready() -> void:
 	add_child(_mesh_inst)
 
 func update_from_state(state: Dictionary) -> void:
-	_target_pos = LevelBuilder.map_to_world(state["x"], state["y"], 0.0)
+	_target_pos = LevelBuilderScript.map_to_world(state["x"], state["y"], 0.0)
 	visible = state["alive"]
-	# Darken toward black as health drops
+	# Darken toward black as health drops, cheap "damaged" feedback
+	# without needing any imported assets.
 	var t: float = clamp(float(state["health"]) / 50.0, 0.15, 1.0)
 	_mat.albedo_color = Color(0.25, 0.55, 0.2) * t
 

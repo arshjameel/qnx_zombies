@@ -13,12 +13,15 @@ const FEED_MAX_LINES := 4
 func _ready() -> void:
 	layer = 5
 
+	var crosshair_wrap := CenterContainer.new()
+	crosshair_wrap.set_anchors_preset(Control.PRESET_FULL_RECT)
+	crosshair_wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(crosshair_wrap)
+
 	var crosshair := Label.new()
 	crosshair.text = "+"
 	crosshair.add_theme_font_size_override("font_size", 28)
-	crosshair.set_anchors_preset(Control.PRESET_CENTER)
-	crosshair.position -= crosshair.size / 2.0
-	add_child(crosshair)
+	crosshair_wrap.add_child(crosshair)
 
 	_health_label = _make_label(24, 16, 22)
 	add_child(_health_label)
