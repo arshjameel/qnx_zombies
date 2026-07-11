@@ -405,8 +405,19 @@ static int start_net_thread_with_scheduling(pthread_t *out_tid)
 {
     int min_fifo = sched_get_priority_min(SCHED_FIFO);
     int max_fifo = sched_get_priority_max(SCHED_FIFO);
-    int render_prio = max_fifo;
-    int net_prio    = (max_fifo + min_fifo) / 2;
+    /* Networking gets priority >= rendering, not lower -- a dropped
+     * frame is a minor cosmetic issue, but if rendering ever fails to
+     * yield the CPU as expected (relies on eglSwapBuffers() actually
+     * blocking for vsync; SCREEN_PROPERTY_SWAP_INTERVAL is set to 1
+     * for exactly this reason, but a real-time SCHED_FIFO thread that
+     * doesn't yield will always starve anything lower-priority
+     * regardless of *why* it isn't yielding), the network thread must
+     * still be able to preempt it and keep the connection alive. The
+     * previous ordering (render=max, net=mid) had this backwards:
+     * correctness-critical networking was the one that could be
+     * starved, not the purely cosmetic render loop. */
+    int net_prio    = max_fifo;
+    int render_prio = (max_fifo + min_fifo) / 2;
 
     struct sched_param render_sp;
     pthread_attr_t     net_attr;
@@ -426,10 +437,24 @@ static int start_net_thread_with_scheduling(pthread_t *out_tid)
     pthread_attr_setschedparam(&net_attr, &net_sp);
 
     rc = pthread_create(out_tid, &net_attr, net_thread_main, NULL);
-    if (rc != 0)
-        fprintf(stderr, "[sched] pthread_create (net thread) failed: %d\n", rc);
-    else
+    if (rc != 0) {
+        /* Retry with default scheduling rather than leaving
+         * networking entirely broken -- SCHED_FIFO thread creation
+         * can fail outright without the right privilege (e.g.
+         * PROCMGR_AID_PRIORITY on QNX, or an rlimit on Linux), and a
+         * plain thread is far better than no thread at all for
+         * something this central to the game actually working. */
+        fprintf(stderr, "[sched] pthread_create with SCHED_FIFO (net thread) "
+                        "failed: %d -- retrying with default scheduling\n", rc);
+        rc = pthread_create(out_tid, NULL, net_thread_main, NULL);
+        if (rc != 0)
+            fprintf(stderr, "[sched] pthread_create (net thread) failed even "
+                            "with default scheduling: %d\n", rc);
+        else
+            printf("[sched] net thread: default scheduling (SCHED_FIFO unavailable)\n");
+    } else {
         printf("[sched] net thread: SCHED_FIFO priority %d\n", net_prio);
+    }
     pthread_attr_destroy(&net_attr);
     return rc;
 }

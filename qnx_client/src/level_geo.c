@@ -129,51 +129,33 @@ static void wall_color(int t, f32 *r, f32 *g, f32 *b)
 /* ------------------------------------------------------------------ */
 static int g_ramp_visited[MAP_ROWS][MAP_W];
 
-static int chain_walkable(int mx, int my)
-{
-    int t = map_tile(mx, my);
-    return t == 0 || t == TILE_RAMP || t == TILE_PLATFORM;
-}
-
-/* Finds the full straight ramp chain that (query_mx, query_my) is
- * part of (that tile must already be known to be TILE_RAMP). Walks
- * backward to the true low end regardless of which tile in the chain
- * the query started from, then collects the whole chain low-to-high
- * into chain_mx/chain_my (caller-provided arrays, size >= 24).
- * Returns the chain length, or 0 if it doesn't run straight from open
- * floor to a platform tile (caller should fall back to flat-ground
- * behavior in that case). If out_index is non-NULL, it's set to the
- * query tile's position within the returned chain (0 = lowest end).
- * If out_dx/out_dy are non-NULL, they're set to the chain's walk
- * direction (always exactly one of them 1 and the other 0) -- needed
- * by build_ramp_chain() to orient the ramp mesh, not by
- * level_exact_ramp_height() which only needs the index.
+/* Walks a SPECIFIC candidate axis (dx,dy fixed to one of (1,0)/(0,1))
+ * starting from query_mx,query_my, and reports whether that axis
+ * produces a valid chain. Returns 0 (invalid) rather than guessing --
+ * the caller (find_ramp_chain) tries both axes and uses whichever one
+ * actually validates, since checking immediate-neighbor walkability
+ * alone can't reliably tell direction apart near a junction where
+ * multiple ramps converge on the same platform (every such tile has
+ * walkable neighbors on BOTH axes, since the surrounding area is open
+ * floor either way).
  *
- * Shared by build_ramp_chain() (mesh generation) and
- * level_exact_ramp_height() (the camera's height query) so there is
- * exactly one implementation of "what chain is this tile part of" --
- * the two were drifting apart before this refactor, which is
- * precisely what caused the camera to float instead of climbing
- * smoothly: it was using a flat guess instead of this real answer. */
-static int find_ramp_chain(int query_mx, int query_my, int chain_mx[], int chain_my[],
-                           int *out_index, int *out_dx, int *out_dy)
+ * Also detects REVERSED chains: a chain is valid whether the low-dx/
+ * dy end is open floor and the high end is the platform (normal), OR
+ * the low end is the platform and the high end is open floor
+ * (reversed) -- both are geometrically valid ramps, just sloping in
+ * opposite directions relative to the chain's own index order. Which
+ * case applies depends on where the platform sits relative to the
+ * ramp, not on which tile you started the query from. */
+static int try_chain_axis(int query_mx, int query_my, int dx, int dy,
+                          int chain_mx[], int chain_my[], int *out_index, int *out_reversed)
 {
-    int horiz_ok = chain_walkable(query_mx - 1, query_my) && chain_walkable(query_mx + 1, query_my);
-    int vert_ok  = chain_walkable(query_mx, query_my - 1) && chain_walkable(query_mx, query_my + 1);
-    int dx = 0, dy = 0;
-    int lo_mx, lo_my, cx, cy, n, i;
+    int lo_mx = query_mx, lo_my = query_my, cx, cy, n = 0, i;
     int before_tile, after_tile;
 
-    if (horiz_ok) dx = 1;
-    else if (vert_ok) dy = 1;
-    else return 0;
-
-    lo_mx = query_mx; lo_my = query_my;
     while (map_tile(lo_mx - dx, lo_my - dy) == TILE_RAMP) {
         lo_mx -= dx; lo_my -= dy;
     }
 
-    n = 0;
     cx = lo_mx; cy = lo_my;
     while (map_tile(cx, cy) == TILE_RAMP && n < 24) {
         chain_mx[n] = cx; chain_my[n] = cy;
@@ -183,7 +165,14 @@ static int find_ramp_chain(int query_mx, int query_my, int chain_mx[], int chain
 
     before_tile = map_tile(lo_mx - dx, lo_my - dy);
     after_tile  = map_tile(cx, cy);
-    if (before_tile != 0 || after_tile != TILE_PLATFORM) return 0;
+
+    if (before_tile == 0 && after_tile == TILE_PLATFORM) {
+        if (out_reversed) *out_reversed = 0;
+    } else if (before_tile == TILE_PLATFORM && after_tile == 0) {
+        if (out_reversed) *out_reversed = 1;
+    } else {
+        return 0;
+    }
 
     if (out_index) {
         *out_index = -1;
@@ -191,16 +180,52 @@ static int find_ramp_chain(int query_mx, int query_my, int chain_mx[], int chain
             if (chain_mx[i] == query_mx && chain_my[i] == query_my) { *out_index = i; break; }
         }
     }
-    if (out_dx) *out_dx = dx;
-    if (out_dy) *out_dy = dy;
     return n;
+}
+
+/* Finds the full straight ramp chain that (query_mx, query_my) is
+ * part of (that tile must already be known to be TILE_RAMP), trying
+ * horizontal then vertical and using whichever actually validates
+ * (see try_chain_axis above for why a single up-front guess isn't
+ * reliable). Returns the chain length, or 0 if neither axis produces
+ * a valid floor-to-platform (or platform-to-floor) chain. If
+ * out_index is non-NULL, set to the query tile's position within the
+ * returned chain (0 = whichever end try_chain_axis walked to first).
+ * If out_dx/out_dy are non-NULL, set to the chain's walk direction.
+ * If out_reversed is non-NULL, set to whether the chain runs
+ * platform-to-floor (1) rather than floor-to-platform (0) as index
+ * increases -- callers need this to get the height gradient right.
+ *
+ * Shared by build_ramp_chain() (mesh generation) and
+ * level_continuous_ramp_height() (the camera's height query) so there
+ * is exactly one implementation of "what chain is this tile part of". */
+static int find_ramp_chain(int query_mx, int query_my, int chain_mx[], int chain_my[],
+                           int *out_index, int *out_dx, int *out_dy, int *out_reversed)
+{
+    int n;
+
+    n = try_chain_axis(query_mx, query_my, 1, 0, chain_mx, chain_my, out_index, out_reversed);
+    if (n > 0) {
+        if (out_dx) *out_dx = 1;
+        if (out_dy) *out_dy = 0;
+        return n;
+    }
+
+    n = try_chain_axis(query_mx, query_my, 0, 1, chain_mx, chain_my, out_index, out_reversed);
+    if (n > 0) {
+        if (out_dx) *out_dx = 0;
+        if (out_dy) *out_dy = 1;
+        return n;
+    }
+
+    return 0;
 }
 
 static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
 {
     int chain_mx[24], chain_my[24];
-    int dx = 0, dy = 0;
-    int n = find_ramp_chain(start_mx, start_my, chain_mx, chain_my, NULL, &dx, &dy);
+    int dx = 0, dy = 0, reversed = 0;
+    int n = find_ramp_chain(start_mx, start_my, chain_mx, chain_my, NULL, &dx, &dy, &reversed);
     int i;
     f32 step;
 
@@ -220,15 +245,25 @@ static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
 
     step = PLATFORM_HEIGHT / (f32)n;
     for (i = 0; i < n; i++) {
-        f32 h_low  = i * step;
-        f32 h_high = (i + 1) * step;
-        f32 rise   = h_high - h_low;
+        /* h_start/h_end are the heights at this tile's -dx/-dy and
+         * +dx/+dy edges respectively -- SIGNED by chain direction, not
+         * just "the two values sorted". For a reversed chain (platform
+         * at the low-index end), height decreases as i increases, so
+         * h_end < h_start and rise is negative -- that sign is what
+         * makes atan2 tilt the segment the correct way; collapsing it
+         * to a plain min/max would connect the mesh with the right
+         * heights but the wrong slope direction. Verified by hand
+         * that adjacent segments' h_end/h_start match continuously in
+         * both the normal and reversed case. */
+        f32 h_start = (reversed ? (f32)(n - i)     : (f32)i)       * step;
+        f32 h_end   = (reversed ? (f32)(n - i - 1) : (f32)(i + 1)) * step;
+        f32 rise   = h_end - h_start;
         f32 run    = TILE_SIZE;
         f32 angle  = atan2f(rise, run);
         f32 slope_len = sqrtf(run * run + rise * rise);
         f32 center_x = (chain_mx[i] + 0.5f) * TILE_SIZE;
         f32 center_z = (chain_my[i] + 0.5f) * TILE_SIZE;
-        f32 center_y = (h_low + h_high) * 0.5f;
+        f32 center_y = (h_start + h_end) * 0.5f;
         Mat4 world, rot;
         f32 hx, hy, hz;
 
@@ -261,9 +296,9 @@ static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
 f32 level_continuous_ramp_height(f32 x, f32 y)
 {
     int mx = (int)x, my = (int)y;
-    int chain_mx[24], chain_my[24], index = -1, dx = 0, dy = 0;
-    int n = find_ramp_chain(mx, my, chain_mx, chain_my, &index, &dx, &dy);
-    f32 frac;
+    int chain_mx[24], chain_my[24], index = -1, dx = 0, dy = 0, reversed = 0;
+    int n = find_ramp_chain(mx, my, chain_mx, chain_my, &index, &dx, &dy, &reversed);
+    f32 frac, effective_frac;
 
     if (n <= 0 || index < 0) return PLATFORM_HEIGHT * 0.5f;   /* malformed chain -- flat fallback */
 
@@ -271,7 +306,12 @@ f32 level_continuous_ramp_height(f32 x, f32 y)
     if (frac < 0.0f) frac = 0.0f;
     if (frac > (f32)n) frac = (f32)n;
 
-    return (frac / (f32)n) * PLATFORM_HEIGHT;
+    /* Reversed: chain_mx[0] is the platform end, not the floor end,
+     * so height runs high-to-low as frac increases -- same reasoning
+     * as build_ramp_chain()'s h_start/h_end. */
+    effective_frac = reversed ? ((f32)n - frac) : frac;
+
+    return (effective_frac / (f32)n) * PLATFORM_HEIGHT;
 }
 
 /* ------------------------------------------------------------------ */

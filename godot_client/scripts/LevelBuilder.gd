@@ -176,33 +176,30 @@ func _build_ramps() -> void:
 				continue
 			_build_ramp_chain(mx, my)
 
-func _chain_walkable(mx: int, my: int) -> bool:
-	var t: int = MapDataScript.tile(mx, my)
-	return t == 0 or t == MapDataScript.TILE_RAMP or t == MapDataScript.TILE_PLATFORM
-
-func _build_ramp_chain(start_mx: int, start_my: int) -> void:
-	var horiz_ok := _chain_walkable(start_mx - 1, start_my) and _chain_walkable(start_mx + 1, start_my)
-	var vert_ok := _chain_walkable(start_mx, start_my - 1) and _chain_walkable(start_mx, start_my + 1)
-
-	var dx := 0
-	var dy := 0
-	if horiz_ok:
-		dx = 1
-	elif vert_ok:
-		dy = 1
-	else:
-		push_warning("Ramp at (%d,%d) isn't part of a straight chain -- skipping. A ramp needs open floor on one end and a platform tile on the other, in a straight line with no turns." % [start_mx, start_my])
-		_ramp_visited["%d,%d" % [start_mx, start_my]] = true
-		return
-
-	# Walk backward to find the low end of the chain.
+## Walks a SPECIFIC candidate axis (dx,dy fixed to one of (1,0)/(0,1))
+## starting from (start_mx, start_my), and reports whether that axis
+## produces a valid chain. Returns {} (invalid) rather than guessing --
+## the caller (_find_ramp_chain) tries both axes and uses whichever one
+## actually validates, since checking immediate-neighbor walkability
+## alone can't reliably tell direction apart near a junction where
+## multiple ramps converge on the same platform (every such tile has
+## walkable neighbors on BOTH axes, since the surrounding area is open
+## floor either way).
+##
+## Also detects REVERSED chains: valid whether the low-dx/dy end is
+## open floor and the high end is the platform (normal), OR the low
+## end is the platform and the high end is open floor (reversed) --
+## both are geometrically valid ramps, just sloping in opposite
+## directions relative to the chain's own index order. Which case
+## applies depends on where the platform sits relative to the ramp,
+## not on which tile the query started from.
+func _try_chain_axis(start_mx: int, start_my: int, dx: int, dy: int) -> Dictionary:
 	var lo_mx := start_mx
 	var lo_my := start_my
 	while MapDataScript.tile(lo_mx - dx, lo_my - dy) == MapDataScript.TILE_RAMP:
 		lo_mx -= dx
 		lo_my -= dy
 
-	# Walk forward from the low end, collecting the whole chain in order.
 	var chain: Array = []
 	var cx := lo_mx
 	var cy := lo_my
@@ -213,12 +210,47 @@ func _build_ramp_chain(start_mx: int, start_my: int) -> void:
 
 	var before_tile: int = MapDataScript.tile(lo_mx - dx, lo_my - dy)
 	var after_tile: int = MapDataScript.tile(cx, cy)
+
+	if before_tile == 0 and after_tile == MapDataScript.TILE_PLATFORM:
+		return {"chain": chain, "reversed": false}
+	elif before_tile == MapDataScript.TILE_PLATFORM and after_tile == 0:
+		return {"chain": chain, "reversed": true}
+	else:
+		return {}
+
+## Finds the full straight ramp chain containing (start_mx, start_my),
+## trying horizontal then vertical and using whichever actually
+## validates. Returns {} if neither axis produces a valid chain, or
+## {"chain": Array[Vector2i], "dx": int, "dy": int, "reversed": bool}.
+func _find_ramp_chain(start_mx: int, start_my: int) -> Dictionary:
+	var result := _try_chain_axis(start_mx, start_my, 1, 0)
+	if not result.is_empty():
+		result["dx"] = 1
+		result["dy"] = 0
+		return result
+
+	result = _try_chain_axis(start_mx, start_my, 0, 1)
+	if not result.is_empty():
+		result["dx"] = 0
+		result["dy"] = 1
+		return result
+
+	return {}
+
+func _build_ramp_chain(start_mx: int, start_my: int) -> void:
+	var result := _find_ramp_chain(start_mx, start_my)
+	if result.is_empty():
+		push_warning("Ramp at (%d,%d) isn't part of a straight chain from open floor to a platform tile -- skipping." % [start_mx, start_my])
+		_ramp_visited["%d,%d" % [start_mx, start_my]] = true
+		return
+
+	var chain: Array = result["chain"]
+	var dx: int = result["dx"]
+	var dy: int = result["dy"]
+	var reversed: bool = result["reversed"]
+
 	for c in chain:
 		_ramp_visited["%d,%d" % [c.x, c.y]] = true
-
-	if before_tile != 0 or after_tile != MapDataScript.TILE_PLATFORM:
-		push_warning("Ramp chain starting at (%d,%d) doesn't run from open floor to a platform tile in a straight line -- skipping." % [start_mx, start_my])
-		return
 
 	var n := chain.size()
 	if n < 3:
@@ -227,7 +259,15 @@ func _build_ramp_chain(start_mx: int, start_my: int) -> void:
 	var step := PLATFORM_HEIGHT / float(n)
 	for i in range(n):
 		var c: Vector2i = chain[i]
-		_build_ramp_segment(c.x, c.y, dx, dy, i * step, (i + 1) * step)
+		# Reversed chains have height decreasing as index increases
+		# (index 0 sits next to the platform, not the floor) -- signed
+		# so _build_ramp_segment's rise = h_high - h_low comes out
+		# negative and tilts the segment the correct way, not just
+		# "the right two values in the wrong order". Matches the
+		# verified h_start/h_end derivation in level_geo.c.
+		var h_start: float = (float(n - i) if reversed else float(i)) * step
+		var h_end: float = (float(n - i - 1) if reversed else float(i + 1)) * step
+		_build_ramp_segment(c.x, c.y, dx, dy, h_start, h_end)
 
 ## Builds one sloped segment of a ramp chain, from height h_low (at
 ## its low edge) to h_high (at its high edge, one tile-length away in
