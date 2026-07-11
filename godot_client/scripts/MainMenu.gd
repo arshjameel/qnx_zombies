@@ -25,7 +25,7 @@ func _ready() -> void:
 	# Full-width strip pinned to the top, text centered within it --
 	# no guessing at the label's rendered width needed, unlike before.
 	var title := Label.new()
-	title.text = "QNX COOP GAME"
+	title.text = "DOOM QNX COOP"
 	title.add_theme_font_size_override("font_size", 48)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	title.set_anchors_preset(Control.PRESET_TOP_WIDE)

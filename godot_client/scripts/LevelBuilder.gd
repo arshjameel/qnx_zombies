@@ -1,5 +1,25 @@
 extends Node3D
 class_name LevelBuilder
+## Attach to an empty Node3D in the Game scene. Generates blocky,
+## Doom-ish geometry from MapData at runtime -- no imported level
+## assets needed, which keeps this fast to iterate on and easy to
+## export to every target (Linux, Windows, QNX) with zero asset
+## pipeline risk.
+##
+## Ramps/platforms (tiles 6/7) are a CLIENT-ONLY feature. The server
+## has zero concept of height -- it only ever tracked (x, y) -- so:
+##   - A zombie standing directly "under" an elevated player is, as
+##     far as the server's math is concerned, at the same position as
+##     that player, so it can still land melee hits on someone who is
+##     actually standing up on a platform. Known quirk, not a bug --
+##     giving the server real verticality would be a much bigger
+##     project than this.
+##   - src/server.c's classify_headshot() assumes a fixed eye height
+##     relative to floor level, so headshots fired down from a
+##     platform will be misclassified for the same reason.
+## Both are acceptable tradeoffs for a client-visual/physics-only
+## verticality feature -- just don't expect the AI or hit detection to
+## know it exists.
 
 const MapDataScript := preload("res://scripts/MapData.gd")
 

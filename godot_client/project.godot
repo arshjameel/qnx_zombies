@@ -5,7 +5,7 @@ config_version=5
 
 [application]
 
-config/name="QNX Coop Game"
+config/name="Doom QNX Coop"
 run/main_scene="res://scenes/MainMenu.tscn"
 config/features=PackedStringArray("4.3", "GL Compatibility")
 config/icon="res://icon.svg"
