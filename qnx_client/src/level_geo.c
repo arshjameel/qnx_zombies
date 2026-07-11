@@ -1,5 +1,5 @@
 /*
- * level_geo.c -- see level_geo.h for the overview.
+ * level_geo.c
  */
 
 #include "level_geo.h"
@@ -20,7 +20,7 @@
 /* ------------------------------------------------------------------ */
 /* Growable vertex list                                                 */
 /* ------------------------------------------------------------------ */
-static void vlist_push(VertexList *vl, f32 x, f32 y, f32 z, f32 r, f32 g, f32 b)
+void vlist_push(VertexList *vl, f32 x, f32 y, f32 z, f32 r, f32 g, f32 b)
 {
     if (vl->count >= vl->capacity) {
         vl->capacity = vl->capacity ? vl->capacity * 2 : 1024;
@@ -38,12 +38,9 @@ void vertex_list_free(VertexList *vl)
     vl->count = vl->capacity = 0;
 }
 
-/* Face indices shared by both box helpers below -- 6 faces, 2 corners
+/* Face indices shared by both box helpers below: 6 faces, 2 corners
  * of a diagonal each (a,b,c,d) forming two triangles (a,b,c) and
- * (a,c,d). Face culling is left disabled in main.c specifically so
- * winding order here doesn't matter -- every face renders regardless
- * of which way it winds, trading a little GPU efficiency for one
- * fewer thing that could silently break unverified. */
+ * (a,c,d). */
 static const int FACES[6][4] = {
     {0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {3,2,6,7}, {4,5,1,0},
 };
@@ -63,8 +60,8 @@ static void emit_box_faces(VertexList *vl, const f32 v[8][3], f32 r, f32 g, f32 
 }
 
 /* Axis-aligned box, centered at (cx,cy,cz), given HALF-extents. */
-static void push_box(VertexList *vl, f32 cx, f32 cy, f32 cz, f32 hx, f32 hy, f32 hz,
-                     f32 r, f32 g, f32 b)
+void push_box(VertexList *vl, f32 cx, f32 cy, f32 cz, f32 hx, f32 hy, f32 hz,
+             f32 r, f32 g, f32 b)
 {
     f32 x0 = cx-hx, x1 = cx+hx;
     f32 y0 = cy-hy, y1 = cy+hy;
