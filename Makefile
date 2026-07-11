@@ -40,8 +40,9 @@ else
 endif
 
 # ---- Pi deployment settings ----
+# Uses the "qnxpi" alias from ~/.ssh/config
 PI_USER := qnxuser
-PI_HOST := 10.0.0.46
+PI_HOST := qnxpi
 PI_DIR  := /data/home/qnxuser/game
 
 .PHONY: all server qnx-server deploy-server run-server clean rebuild
