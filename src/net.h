@@ -2,19 +2,15 @@
 #define NET_H
 
 #include "common.h"
+#include "map.h"   /* for MAX_PICKUP_SPAWNS -- pickup slots are 1:1 with map markers */
 
-/* any changed here must mirror the changes in Network.gd's constants 
- * and functions
- */
-
-/* ------------------------------------------------------------------ */
 #define NET_PORT         7777
 #define NET_MAX_PLAYERS  8
 #define NET_TICK_RATE    20        /* server sends state 20x/sec */
 #define MAX_ZOMBIES      16
 
 /* ------------------------------------------------------------------ */
-/* Packet types                                                       */
+/* Packet types                                                         */
 /* ------------------------------------------------------------------ */
 #define PKT_CONNECT     0x01u  /* client -> server: join request       */
 #define PKT_ACCEPT      0x02u  /* server -> client: assigned player_id */
@@ -24,16 +20,20 @@
 #define PKT_DISCONNECT  0x07u  /* either direction                     */
 
 /* ------------------------------------------------------------------ */
-/* Entity types (used in PktHit to disambiguate victim_id)            */
+/* Entity types (used in PktHit to disambiguate victim_id)             */
 /* ------------------------------------------------------------------ */
 #define ENTITY_PLAYER   0u
 #define ENTITY_ZOMBIE   1u
 
-/* Sentinel attacker_id */
+/* ------------------------------------------------------------------ */
+/* Pickup types                                                         */
+/* ------------------------------------------------------------------ */
+#define PICKUP_AMMO     0u
+#define PICKUP_HEALTH   1u
 #define ATTACKER_ZOMBIE 0xFFu
 
 /* ------------------------------------------------------------------ */
-/* Packet structures                                                  */
+/* Packet structures                                                    */
 /* ------------------------------------------------------------------ */
 #pragma pack(push, 1)
 
@@ -41,7 +41,15 @@ typedef struct {
     u8  type;
     u8  player_id;
     u32 tick;
-} PktHeader;
+} PktHeader;                                          
+
+typedef struct {
+    PktHeader hdr;
+    u8        mode;      /* 0 = coop (shared world), 1 = solo (private world) */
+} PktConnect;                                          
+
+#define CONNECT_MODE_COOP  0u
+#define CONNECT_MODE_SOLO  1u
 
 typedef struct {
     PktHeader hdr;
@@ -49,7 +57,7 @@ typedef struct {
     f32       spawn_x;
     f32       spawn_y;
     f32       spawn_angle;
-} PktAccept;
+} PktAccept;                                           
 
 typedef struct {
     PktHeader hdr;
@@ -57,9 +65,10 @@ typedef struct {
     u8        back;
     u8        strafe_left;
     u8        strafe_right;
-    f32       look_angle; // absolute yaw in radians for client mouse-look
+    f32       look_angle;    /* absolute yaw in radians, player mouse-look */
     u8        shoot;
-} PktInput;
+    f32       pitch;         /* absolute pitch in radians, +up/-down for headshot vertical classification
+} PktInput;                                            
 
 typedef struct {
     u8  player_id;
@@ -69,7 +78,7 @@ typedef struct {
     f32 angle;
     u8  health;
     u8  ammo;
-} PlayerState;
+} PlayerState;                                         
 
 typedef struct {
     u8  zombie_id;
@@ -77,7 +86,15 @@ typedef struct {
     f32 x;
     f32 y;
     u8  health;
-} ZombieState;
+} ZombieState;                                         
+
+typedef struct {
+    u8  pickup_id;    /* index into the map's pickup-marker list */
+    u8  type;         /* PICKUP_AMMO or PICKUP_HEALTH */
+    u8  active;       /* 0 while on cooldown after being taken */
+    f32 x;
+    f32 y;
+} PickupState;
 
 typedef struct {
     PktHeader   hdr;
@@ -86,15 +103,18 @@ typedef struct {
     u8          zombie_count;
     ZombieState zombies[MAX_ZOMBIES];
     u8          wave;
-} PktState;
+    u8          pickup_count;
+    PickupState pickups[MAX_PICKUP_SPAWNS];
+} PktState;                    
 
 typedef struct {
     PktHeader hdr;
     u8        victim_id;
-    u8        victim_type;   /* ENTITY_PLAYER or ENTITY_ZOMBIE */
-    u8        attacker_id;   /* player id or ATTACKER_ZOMBIE  */
+    u8        victim_type;
+    u8        attacker_id;   
     u8        damage;
-} PktHit;                                              
+    u8        headshot;      
+} PktHit;
 
 #pragma pack(pop)
 
@@ -102,10 +122,7 @@ typedef struct {
 /* Socket helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-/* create non-blocking UDP socket */
 int net_udp_socket(void);
-
-/* bind socket to port/server */
 int net_bind(int sock, u16 port);
 
 #endif

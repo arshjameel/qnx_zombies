@@ -6,9 +6,9 @@
 #include <stdio.h>
 
 #if defined(__QNXNTO__)
-#  include <sys/time.h>    /* struct timeval for polling */
+#  include <sys/time.h>    /* struct timeval */
 #  include <sys/types.h>   /* close() on QNX */
-#  include <unistd.h>      /* backup if close() doesnt work*/
+#  include <unistd.h>      /* close() backup */
 #else
 #  include <unistd.h>      /* close() */
 #  include <fcntl.h>       /* fcntl, O_NONBLOCK */
@@ -20,11 +20,6 @@ int net_udp_socket(void)
     if (sock < 0) { perror("socket"); return -1; }
 
 #if defined(__QNXNTO__)
-    /*
-     * SO_RCVTIMEO on QNX
-     * return EAGAIN when no data is ready
-     * O_NONBLOCK on a linux machine
-     */
     struct timeval tv;
     tv.tv_sec  = 0;
     tv.tv_usec = 1000;   /* 1 ms */

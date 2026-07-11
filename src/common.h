@@ -1,12 +1,6 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-/*
- * __EXT_POSIX1_199309 and __EXT_XOPEN_EX are injected via
- * -D flags in the Makefile QNX_DEFS variable so they are defined
- * before any system header is parsed. Do not define _POSIX_C_SOURCE
- * here as it conflicts with __EXT_* on QNX and suppresses symbols.
- */
 #if !defined(__QNXNTO__)
 #  define _POSIX_C_SOURCE 199309L
 #endif
@@ -33,7 +27,7 @@
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Debug logging compiled in release builds (NDEBUG)            */
+/* Debug logging                                                       */
 /* ------------------------------------------------------------------ */
 #ifdef NDEBUG
 #  define DLOG(fmt, ...) ((void)0)
