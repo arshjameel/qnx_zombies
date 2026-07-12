@@ -95,16 +95,29 @@ typedef struct {
     u8  ammo;
 } PlayerState;                                         /* 16 bytes */
 
+/* ------------------------------------------------------------------ */
+/* Zombie types -- colors/sizes are a client-side concern (Zombie.gd /  */
+/* qnx_client's build_entity_geometry), the server only cares about    */
+/* the stat differences (health/speed/dmg, see server.c).              */
+/* ------------------------------------------------------------------ */
+#define ZOMBIE_TYPE_NORMAL  0u   /* green, wave 1+  */
+#define ZOMBIE_TYPE_TANK    1u   /* red, bigger, wave 2+ -- the mini-boss */
+#define ZOMBIE_TYPE_BOSS    2u   /* blue, biggest, wave 4 final boss */
+
 typedef struct {
     u8  zombie_id;
     u8  alive;
+    u8  type;   /* ZOMBIE_TYPE_NORMAL / TANK / BOSS -- picks color+size client-side */
     f32 x;
     f32 y;
     f32 z;      /* height above floor. 0 unless the server has it
                  * climbing a ramp or standing on a platform -- see
                  * server.c's zombie_tick() COUPLING WARNING. */
     u8  health;
-} ZombieState;                                         /* 15 bytes */
+    u8  health_max;  /* so the client's health-bar percentage is correct
+                       * regardless of type -- tank/boss have far more HP
+                       * than a normal zombie's fixed old value. */
+} ZombieState;                                         /* 17 bytes */
 
 typedef struct {
     u8  pickup_id;    /* index into the map's pickup-marker list, stable */
@@ -125,7 +138,10 @@ typedef struct {
      * field's offset unchanged for anything still using the old layout. */
     u8          pickup_count;
     PickupState pickups[MAX_PICKUP_SPAWNS];
-} PktState;                    /* 6+1+128+1+240+1+1+(16*11) = 554 bytes fixed */
+} PktState;                    /* 6+1+128+1+272+1+1+(16*11) = 586 bytes fixed --
+                                 * verified with sizeof(), not hand math, since
+                                 * ZombieState grew 15->17 bytes with the type/
+                                 * health_max fields. */
 
 typedef struct {
     PktHeader hdr;

@@ -40,7 +40,7 @@ const CONNECT_SIZE      := HEADER_SIZE + 1                          # 7
 const ACCEPT_SIZE       := HEADER_SIZE + 1 + 4 + 4 + 4              # 19
 const INPUT_SIZE        := HEADER_SIZE + 1 + 1 + 1 + 1 + 4 + 1 + 4  # 19
 const PLAYER_STATE_SIZE := 1 + 1 + 4 + 4 + 4 + 1 + 1                # 16
-const ZOMBIE_STATE_SIZE := 1 + 1 + 4 + 4 + 4 + 1                    # 15
+const ZOMBIE_STATE_SIZE := 1 + 1 + 1 + 4 + 4 + 4 + 1 + 1              # 17 (id, alive, type, x, y, z, health, health_max)
 const PICKUP_STATE_SIZE := 1 + 1 + 1 + 4 + 4                        # 11
 const HIT_SIZE           := HEADER_SIZE + 1 + 1 + 1 + 1 + 1          # 11
 
@@ -54,7 +54,7 @@ var is_connected: bool = false
 
 # Latest authoritative snapshot, keyed by id. Populated from PKT_STATE.
 var players: Dictionary = {}   # id -> {alive, x, y, angle, health, ammo}
-var zombies: Dictionary = {}   # id -> {alive, x, y, health}
+var zombies: Dictionary = {}   # id -> {alive, type, x, y, z, health, health_max}
 var pickups: Dictionary = {}   # id -> {type, active, x, y}
 var wave: int = 0
 
@@ -187,13 +187,16 @@ func _poll_incoming() -> void:
 				for i in range(MAX_ZOMBIES):
 					var zid := pba.get_u8()
 					var zalive := pba.get_u8()
+					var ztype := pba.get_u8()
 					var zx := pba.get_float()
 					var zy := pba.get_float()
 					var zz := pba.get_float()
 					var zhealth := pba.get_u8()
+					var zhealth_max := pba.get_u8()
 					if i < zombie_count:
 						new_zombies[zid] = {
-							"alive": zalive != 0, "x": zx, "y": zy, "z": zz, "health": zhealth,
+							"alive": zalive != 0, "type": ztype, "x": zx, "y": zy, "z": zz,
+							"health": zhealth, "health_max": zhealth_max,
 						}
 				wave = pba.get_u8()
 

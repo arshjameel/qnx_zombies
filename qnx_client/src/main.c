@@ -232,6 +232,9 @@ typedef struct {
 typedef struct {
     u8  id;
     int alive;
+    u8  type;   /* ZOMBIE_TYPE_NORMAL/TANK/BOSS, from net.h -- picks
+                 * color+size in build_entity_geometry(), matching
+                 * Zombie.gd's scheme on the Godot side */
     f32 x, y, z;
 } RenderZombie;
 
@@ -363,6 +366,7 @@ static void *net_thread_main(void *arg)
                     ZombieState *zs = &st->zombies[i];
                     tmp_zombies[zc].id    = zs->zombie_id;
                     tmp_zombies[zc].alive = zs->alive;
+                    tmp_zombies[zc].type  = zs->type;
                     tmp_zombies[zc].x     = zs->x;
                     tmp_zombies[zc].y     = zs->y;
                     tmp_zombies[zc].z     = zs->z;
@@ -802,10 +806,24 @@ static VertexList build_entity_geometry(void)
                  0.9f, 0.75f, 0.1f);   /* yellow -- teammate, matches RemotePlayer.gd */
     }
     for (i = 0; i < zombie_count; i++) {
+        f32 scale, r, g, b, half_h, half_r;
         if (!zombies[i].alive) continue;
-        push_box(&vl, zombies[i].x, zombies[i].z + 0.9f, zombies[i].y,
-                 0.35f, 0.9f, 0.35f,
-                 0.25f, 0.55f, 0.2f);   /* sickly green, matches Zombie.gd */
+
+        /* Matches Zombie.gd's BASE_HEIGHT=1.8/BASE_RADIUS=0.35 and its
+         * TANK_SCALE/BOSS_SCALE/COLOR_* constants exactly, so a tank
+         * or boss looks the same size and color on both clients. */
+        switch (zombies[i].type) {
+            case ZOMBIE_TYPE_TANK:
+                scale = 1.3f; r = 0.75f; g = 0.15f; b = 0.15f; break;
+            case ZOMBIE_TYPE_BOSS:
+                scale = 1.7f; r = 0.15f; g = 0.35f; b = 0.85f; break;
+            default:
+                scale = 1.0f; r = 0.25f; g = 0.55f; b = 0.20f; break;
+        }
+        half_h = 0.9f * scale;
+        half_r = 0.35f * scale;
+        push_box(&vl, zombies[i].x, zombies[i].z + half_h, zombies[i].y,
+                 half_r, half_h, half_r, r, g, b);
     }
     for (i = 0; i < pickup_count; i++) {
         if (!pickups[i].active) continue;   /* on cooldown -- hidden, matches Pickup.gd */

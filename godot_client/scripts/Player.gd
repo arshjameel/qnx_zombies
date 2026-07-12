@@ -25,7 +25,7 @@ const RECONCILE_LERP := 0.35
 # as walking up a ramp -- this just fixes "why don't I fall back down".
 const GRAVITY := 9.8
 const JUMP_VELOCITY := 4.5
-
+const LOOK_SPEED := 2.0
 var camera: Camera3D
 var pitch: float = 0.0
 
@@ -63,6 +63,13 @@ func _unhandled_input(event: InputEvent) -> void:
 	# Game.gd, which also releases the mouse. Nothing needed here.
 
 func _physics_process(delta: float) -> void:
+	if Input.is_key_pressed(KEY_LEFT):  rotate_y(LOOK_SPEED * delta)
+	if Input.is_key_pressed(KEY_RIGHT): rotate_y(-LOOK_SPEED * delta)
+	if Input.is_key_pressed(KEY_UP):    pitch += LOOK_SPEED * delta
+	if Input.is_key_pressed(KEY_DOWN):  pitch -= LOOK_SPEED * delta
+	pitch = clamp(pitch, deg_to_rad(-80), deg_to_rad(80))
+	camera.rotation.x = pitch
+	
 	var fwd := false
 	var back := false
 	var left := false

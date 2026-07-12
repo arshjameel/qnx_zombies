@@ -52,13 +52,47 @@
 #define AMMO_PICKUP_AMOUNT    15
 #define HEALTH_PICKUP_AMOUNT  25
 
-#define ZOMBIE_SPEED              0.05f
-#define ZOMBIE_HEALTH             100
-#define ZOMBIE_DAMAGE             20
+/* Per-type zombie stats. Health is capped at 255 on purpose -- the wire
+ * field (ZombieState.health) is a single byte, so BOSS_HEALTH is the
+ * max a u8 can hold rather than a "real" boss-scale number. */
+#define ZOMBIE_SPEED   0.05f
+#define ZOMBIE_HEALTH  100
+#define ZOMBIE_DAMAGE  20
+
+#define TANK_SPEED     0.04f   /* a little slower -- bulkier */
+#define TANK_HEALTH    180
+#define TANK_DAMAGE    35
+
+#define BOSS_SPEED     0.035f
+#define BOSS_HEALTH    255
+#define BOSS_DAMAGE    50
+
 #define ZOMBIE_ATTACK_RANGE       0.8f
 #define ZOMBIE_ATTACK_COOLDOWN    (NET_TICK_RATE * 1)  /* 1 attack/sec */
-#define WAVE_BASE_ZOMBIES         3
-#define WAVE_ZOMBIE_INCREMENT     2
+
+/* ------------------------------------------------------------------ */
+/* Wave design -- 4 waves, all on the one map (no separate arena):     */
+/*   Wave 1: 3 normal                                                   */
+/*   Wave 2: 5 normal + 1 tank (mini-boss)                              */
+/*   Wave 3: 7 normal + 3 tank                                          */
+/*   Wave 4: final boss                                                 */
+/* spawn_wave() is a no-op past WAVE_COUNT -- wave 4's boss is the last */
+/* thing that ever spawns for a session; no wave 5 follows.             */
+/* ------------------------------------------------------------------ */
+#define WAVE_COUNT 4
+
+typedef struct {
+    int normal_count;
+    int tank_count;
+    int boss_count;
+} WaveDef;
+
+static const WaveDef WAVE_TABLE[WAVE_COUNT] = {
+    { 3, 0, 0 },   /* wave 1 */
+    { 5, 1, 0 },   /* wave 2 */
+    { 7, 3, 0 },   /* wave 3 */
+    { 0, 0, 1 },   /* wave 4 -- final boss */
+};
 
 /* Head/body hitbox split. The server has no real 3D geometry -- height
  * only ever existed as a client-side rendering convention -- so this
@@ -105,12 +139,20 @@ static const f32 SPAWN_Y[SPAWN_COUNT] = { 2.5f,  2.5f, 21.5f, 21.5f };
 static const f32 SPAWN_A[SPAWN_COUNT] = { 0.0f,  3.14f,  1.57f, 4.71f };
 
 /* Zombie spawn points -- all verified open floor tiles in map.c,
- * spread across the middle of the map, away from player spawn corners. */
+ * spread across the middle of the map, away from player spawn corners.
+ * Index 3 was originally (12.5, 11.5), which the map redesign moved
+ * onto the elevated platform -- fixed to (12.5, 6.5), still open floor,
+ * still roughly central. */
 #define ZOMBIE_SPAWN_COUNT 8
 static const f32 ZOMBIE_SPAWN_X[ZOMBIE_SPAWN_COUNT] =
     { 8.5f, 15.5f, 4.5f, 12.5f, 19.5f, 8.5f, 15.5f, 12.5f };
 static const f32 ZOMBIE_SPAWN_Y[ZOMBIE_SPAWN_COUNT] =
-    { 2.5f,  2.5f, 11.5f, 11.5f, 11.5f, 21.5f, 21.5f, 20.5f };
+    { 2.5f,  2.5f, 11.5f,  6.5f, 11.5f, 21.5f, 21.5f, 20.5f };
+
+/* Dedicated boss entrance point -- north-center, clearly clear of the
+ * platform/ramp structure and away from every player spawn corner. */
+#define BOSS_SPAWN_X 12.5f
+#define BOSS_SPAWN_Y 3.5f
 
 /* ------------------------------------------------------------------ */
 /* Server player                                                        */
@@ -139,9 +181,12 @@ typedef struct {
     int active;
     int alive;
     u8  session_id;
+    u8  type;           /* ZOMBIE_TYPE_NORMAL / TANK / BOSS */
     f32 x, y;
     f32 z;              /* height above floor -- see zombie_tick's COUPLING WARNING */
     u8  health;
+    u8  health_max;      /* set at spawn from the per-type constant, sent on the wire
+                           * so the client's health bar percentage is correct */
     int attack_cooldown;
 } ServerZombie;
 
@@ -242,25 +287,68 @@ static int any_player_connected_in(u8 session_id)
     return 0;
 }
 
-static void spawn_wave(u8 session_id)
+/* Finds a free zombie slot and fills it in as `type` at (x,y). Health
+ * (current + max) comes from the per-type constants so tank/boss are
+ * meaningfully tankier than a normal zombie. Returns 1 if a slot was
+ * found and used, 0 if MAX_ZOMBIES is already full. */
+static int spawn_one_zombie(u8 session_id, u8 type, f32 x, f32 y)
 {
-    int want    = WAVE_BASE_ZOMBIES + (int)g_wave[session_id] * WAVE_ZOMBIE_INCREMENT;
-    int spawned = 0, i;
-
-    for (i = 0; i < MAX_ZOMBIES && spawned < want; i++) {
+    int i;
+    for (i = 0; i < MAX_ZOMBIES; i++) {
+        u8 hp;
         if (g_zombies[i].active) continue;
+        switch (type) {
+            case ZOMBIE_TYPE_TANK: hp = TANK_HEALTH; break;
+            case ZOMBIE_TYPE_BOSS: hp = BOSS_HEALTH; break;
+            default:               hp = ZOMBIE_HEALTH; break;
+        }
         g_zombies[i].active          = 1;
         g_zombies[i].alive           = 1;
         g_zombies[i].session_id      = session_id;
+        g_zombies[i].type            = type;
         g_zombies[i].z               = 0.0f;
-        g_zombies[i].health          = ZOMBIE_HEALTH;
-        g_zombies[i].x               = ZOMBIE_SPAWN_X[i % ZOMBIE_SPAWN_COUNT];
-        g_zombies[i].y               = ZOMBIE_SPAWN_Y[i % ZOMBIE_SPAWN_COUNT];
+        g_zombies[i].health          = hp;
+        g_zombies[i].health_max      = hp;
+        g_zombies[i].x               = x;
+        g_zombies[i].y               = y;
         g_zombies[i].attack_cooldown = 0;
-        spawned++;
+        return 1;
     }
-    g_wave[session_id]++;
-    printf("Session %d: wave %d started, %d zombies\n", session_id, g_wave[session_id], spawned);
+    return 0;
+}
+
+/* Spawns the next wave for a session per WAVE_TABLE. No-op past
+ * WAVE_COUNT -- the session has already beaten the boss and no
+ * further wave follows. */
+static void spawn_wave(u8 session_id)
+{
+    u8 w = g_wave[session_id] + 1;
+    int spawned = 0, i;
+    const WaveDef *def;
+
+    if (w > WAVE_COUNT) return;   /* boss already defeated -- session is over */
+    g_wave[session_id] = w;
+    def = &WAVE_TABLE[w - 1];
+
+    for (i = 0; i < def->normal_count; i++) {
+        f32 x = ZOMBIE_SPAWN_X[i % ZOMBIE_SPAWN_COUNT];
+        f32 y = ZOMBIE_SPAWN_Y[i % ZOMBIE_SPAWN_COUNT];
+        if (spawn_one_zombie(session_id, ZOMBIE_TYPE_NORMAL, x, y)) spawned++;
+    }
+    for (i = 0; i < def->tank_count; i++) {
+        /* offset the index so tanks don't land on the exact same tiles
+         * as the normals that were just placed above */
+        int idx = i + def->normal_count;
+        f32 x = ZOMBIE_SPAWN_X[idx % ZOMBIE_SPAWN_COUNT];
+        f32 y = ZOMBIE_SPAWN_Y[idx % ZOMBIE_SPAWN_COUNT];
+        if (spawn_one_zombie(session_id, ZOMBIE_TYPE_TANK, x, y)) spawned++;
+    }
+    for (i = 0; i < def->boss_count; i++) {
+        if (spawn_one_zombie(session_id, ZOMBIE_TYPE_BOSS, BOSS_SPAWN_X, BOSS_SPAWN_Y)) spawned++;
+    }
+
+    printf("Session %d: wave %d started -- %d normal, %d tank, %d boss (%d total)\n",
+           session_id, w, def->normal_count, def->tank_count, def->boss_count, spawned);
 }
 
 /* Called once at startup. Reads pickup spawn points from the map and
@@ -451,12 +539,14 @@ static void send_state_to_session(u8 session_id)
     for (i = 0; i < MAX_ZOMBIES; i++) {
         if (!g_zombies[i].active || g_zombies[i].session_id != session_id) continue;
         ZombieState *zs = &pkt.zombies[zactive++];
-        zs->zombie_id = (u8)i;
-        zs->alive     = (u8)g_zombies[i].alive;
-        zs->x         = g_zombies[i].x;
-        zs->y         = g_zombies[i].y;
-        zs->z         = g_zombies[i].z;
-        zs->health    = g_zombies[i].health;
+        zs->zombie_id  = (u8)i;
+        zs->alive      = (u8)g_zombies[i].alive;
+        zs->type       = g_zombies[i].type;
+        zs->x          = g_zombies[i].x;
+        zs->y          = g_zombies[i].y;
+        zs->z          = g_zombies[i].z;
+        zs->health     = g_zombies[i].health;
+        zs->health_max = g_zombies[i].health_max;
     }
     pkt.zombie_count = (u8)zactive;
     pkt.wave         = g_wave[session_id];
@@ -535,7 +625,16 @@ static void recv_packets(void)
                 printf("Player %d connected (session %d, %s)  %s:%d\n",
                        id, sid, c->mode == CONNECT_MODE_SOLO ? "solo" : "coop",
                        inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-                if (count_alive_zombies_in(sid) == 0)
+                /* Only auto-start wave 1 for a session that hasn't
+                 * played at all yet. Without the g_wave==0 guard, a
+                 * player reconnecting mid-run (or a second coop player
+                 * joining between waves) could re-trigger spawn_wave()
+                 * on top of whatever wave is already in progress --
+                 * spawn_wave() isn't idempotent (it always increments
+                 * g_wave), so this could silently double-advance the
+                 * wave counter if it fires the same tick as the normal
+                 * wave-clear check below. */
+                if (g_wave[sid] == 0)
                     spawn_wave(sid);
             }
             send_accept(id);
@@ -603,6 +702,26 @@ static void zombie_height_tick(ServerZombie *z)
     }
 }
 
+/* Per-type movement speed and attack damage -- see the ZOMBIE_SPEED /
+ * TANK_SPEED / BOSS_SPEED and *_DAMAGE constants near the wave table. */
+static f32 zombie_speed_for(u8 type)
+{
+    switch (type) {
+        case ZOMBIE_TYPE_TANK: return TANK_SPEED;
+        case ZOMBIE_TYPE_BOSS: return BOSS_SPEED;
+        default:               return ZOMBIE_SPEED;
+    }
+}
+
+static u8 zombie_damage_for(u8 type)
+{
+    switch (type) {
+        case ZOMBIE_TYPE_TANK: return TANK_DAMAGE;
+        case ZOMBIE_TYPE_BOSS: return BOSS_DAMAGE;
+        default:               return ZOMBIE_DAMAGE;
+    }
+}
+
 static void zombie_tick(void)
 {
     int i, p;
@@ -630,13 +749,14 @@ static void zombie_tick(void)
         f32 dist = best_dist;
 
         if (dist > ZOMBIE_ATTACK_RANGE) {
-            f32 nx = z->x + (dx / dist) * ZOMBIE_SPEED;
-            f32 ny = z->y + (dy / dist) * ZOMBIE_SPEED;
+            f32 speed = zombie_speed_for(z->type);
+            f32 nx = z->x + (dx / dist) * speed;
+            f32 ny = z->y + (dy / dist) * speed;
             if (!map_is_wall((int)nx, (int)z->y)) z->x = nx;
             if (!map_is_wall((int)z->x, (int)ny)) z->y = ny;
         } else if (z->attack_cooldown <= 0) {
             ServerPlayer *pl = &g_players[target];
-            u8 dmg = ZOMBIE_DAMAGE;
+            u8 dmg = zombie_damage_for(z->type);
             pl->health = (pl->health > dmg) ? pl->health - dmg : 0;
             broadcast_hit(z->session_id, (u8)target, ENTITY_PLAYER, ATTACKER_ZOMBIE, dmg, 0);
             if (pl->health == 0) {
