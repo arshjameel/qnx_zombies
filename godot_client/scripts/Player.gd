@@ -25,7 +25,12 @@ const RECONCILE_LERP := 0.35
 # as walking up a ramp -- this just fixes "why don't I fall back down".
 const GRAVITY := 9.8
 const JUMP_VELOCITY := 4.5
+
+# Arrow-key look, alongside mouse -- fallback for setups without a
+# mouse (or just a preference). Radians/sec, matches qnx_client's
+# LOOK_SPEED for a consistent feel between the two clients.
 const LOOK_SPEED := 2.0
+
 var camera: Camera3D
 var pitch: float = 0.0
 
@@ -69,7 +74,7 @@ func _physics_process(delta: float) -> void:
 	if Input.is_key_pressed(KEY_DOWN):  pitch -= LOOK_SPEED * delta
 	pitch = clamp(pitch, deg_to_rad(-80), deg_to_rad(80))
 	camera.rotation.x = pitch
-	
+
 	var fwd := false
 	var back := false
 	var left := false

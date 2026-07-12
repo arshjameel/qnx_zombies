@@ -20,13 +20,14 @@
 /* ------------------------------------------------------------------ */
 /* Growable vertex list                                                 */
 /* ------------------------------------------------------------------ */
-void vlist_push(VertexList *vl, f32 x, f32 y, f32 z, f32 r, f32 g, f32 b)
+void vlist_push(VertexList *vl, f32 x, f32 y, f32 z, f32 nx, f32 ny, f32 nz, f32 r, f32 g, f32 b)
 {
     if (vl->count >= vl->capacity) {
         vl->capacity = vl->capacity ? vl->capacity * 2 : 1024;
         vl->verts = (GeoVertex *)realloc(vl->verts, sizeof(GeoVertex) * (size_t)vl->capacity);
     }
     vl->verts[vl->count].x = x; vl->verts[vl->count].y = y; vl->verts[vl->count].z = z;
+    vl->verts[vl->count].nx = nx; vl->verts[vl->count].ny = ny; vl->verts[vl->count].nz = nz;
     vl->verts[vl->count].r = r; vl->verts[vl->count].g = g; vl->verts[vl->count].b = b;
     vl->count++;
 }
@@ -48,17 +49,26 @@ static const int FACES[6][4] = {
     {0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {3,2,6,7}, {4,5,1,0},
 };
 
-static void emit_box_faces(VertexList *vl, const f32 v[8][3], f32 r, f32 g, f32 b)
+/* Local (unrotated) outward normal per face, matching FACES above --
+ * verified against the actual corner layout (which axis is constant
+ * across all 4 corners of each face) rather than derived by eye. */
+static const f32 FACE_NORMALS[6][3] = {
+    { 0,  0, -1}, { 0,  0,  1}, {-1,  0,  0}, { 1,  0,  0}, { 0,  1,  0}, { 0, -1,  0},
+};
+
+static void emit_box_faces(VertexList *vl, const f32 v[8][3], const f32 normals[6][3],
+                           f32 r, f32 g, f32 b)
 {
     int f;
     for (f = 0; f < 6; f++) {
         int a = FACES[f][0], bI = FACES[f][1], c = FACES[f][2], d = FACES[f][3];
-        vlist_push(vl, v[a][0],  v[a][1],  v[a][2],  r, g, b);
-        vlist_push(vl, v[bI][0], v[bI][1], v[bI][2], r, g, b);
-        vlist_push(vl, v[c][0],  v[c][1],  v[c][2],  r, g, b);
-        vlist_push(vl, v[a][0],  v[a][1],  v[a][2],  r, g, b);
-        vlist_push(vl, v[c][0],  v[c][1],  v[c][2],  r, g, b);
-        vlist_push(vl, v[d][0],  v[d][1],  v[d][2],  r, g, b);
+        f32 nx = normals[f][0], ny = normals[f][1], nz = normals[f][2];
+        vlist_push(vl, v[a][0],  v[a][1],  v[a][2],  nx, ny, nz, r, g, b);
+        vlist_push(vl, v[bI][0], v[bI][1], v[bI][2], nx, ny, nz, r, g, b);
+        vlist_push(vl, v[c][0],  v[c][1],  v[c][2],  nx, ny, nz, r, g, b);
+        vlist_push(vl, v[a][0],  v[a][1],  v[a][2],  nx, ny, nz, r, g, b);
+        vlist_push(vl, v[c][0],  v[c][1],  v[c][2],  nx, ny, nz, r, g, b);
+        vlist_push(vl, v[d][0],  v[d][1],  v[d][2],  nx, ny, nz, r, g, b);
     }
 }
 
@@ -73,7 +83,7 @@ void push_box(VertexList *vl, f32 cx, f32 cy, f32 cz, f32 hx, f32 hy, f32 hz,
         {x0,y0,z0},{x1,y0,z0},{x1,y1,z0},{x0,y1,z0},
         {x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1},
     };
-    emit_box_faces(vl, v, r, g, b);
+    emit_box_faces(vl, v, FACE_NORMALS, r, g, b);
 }
 
 /* Box transformed by an arbitrary world matrix -- used for ramp
@@ -87,22 +97,41 @@ static void push_box_transformed(VertexList *vl, Mat4 world, f32 hx, f32 hy, f32
         {-hx,-hy, hz},{hx,-hy, hz},{hx,hy, hz},{-hx,hy, hz},
     };
     f32 wv[8][3];
+    f32 rotated_normals[6][3];
+    f32 origin_x, origin_y, origin_z;
     int i;
+
     for (i = 0; i < 8; i++)
         mat4_transform_point(world, lv[i][0], lv[i][1], lv[i][2],
                               &wv[i][0], &wv[i][1], &wv[i][2]);
-    emit_box_faces(vl, wv, r, g, b);
+
+    /* mat4_transform_point() applies translation too, which a direction
+     * vector must NOT get -- transforming the origin and subtracting it
+     * back out cancels the translation, leaving just the rotation. Exact
+     * (not an approximation) as long as `world` has no scale, which is
+     * true here (translate * rotate only, see build_ramp_chain). */
+    mat4_transform_point(world, 0.0f, 0.0f, 0.0f, &origin_x, &origin_y, &origin_z);
+    for (i = 0; i < 6; i++) {
+        f32 tx, ty, tz;
+        mat4_transform_point(world, FACE_NORMALS[i][0], FACE_NORMALS[i][1], FACE_NORMALS[i][2],
+                              &tx, &ty, &tz);
+        rotated_normals[i][0] = tx - origin_x;
+        rotated_normals[i][1] = ty - origin_y;
+        rotated_normals[i][2] = tz - origin_z;
+    }
+
+    emit_box_faces(vl, wv, rotated_normals, r, g, b);
 }
 
 static void push_quad_y(VertexList *vl, f32 y, f32 x0, f32 z0, f32 x1, f32 z1,
-                        f32 r, f32 g, f32 b)
+                        f32 normal_y, f32 r, f32 g, f32 b)
 {
-    vlist_push(vl, x0, y, z0, r, g, b);
-    vlist_push(vl, x1, y, z0, r, g, b);
-    vlist_push(vl, x1, y, z1, r, g, b);
-    vlist_push(vl, x0, y, z0, r, g, b);
-    vlist_push(vl, x1, y, z1, r, g, b);
-    vlist_push(vl, x0, y, z1, r, g, b);
+    vlist_push(vl, x0, y, z0, 0.0f, normal_y, 0.0f, r, g, b);
+    vlist_push(vl, x1, y, z0, 0.0f, normal_y, 0.0f, r, g, b);
+    vlist_push(vl, x1, y, z1, 0.0f, normal_y, 0.0f, r, g, b);
+    vlist_push(vl, x0, y, z0, 0.0f, normal_y, 0.0f, r, g, b);
+    vlist_push(vl, x1, y, z1, 0.0f, normal_y, 0.0f, r, g, b);
+    vlist_push(vl, x0, y, z1, 0.0f, normal_y, 0.0f, r, g, b);
 }
 
 /* Matches MapData.gd's WALL_COLORS -- keep in sync by hand (see the
@@ -327,8 +356,8 @@ VertexList build_level_geometry(void)
     /* Floor + ceiling */
     {
         f32 w = MAP_W * TILE_SIZE, d = MAP_ROWS * TILE_SIZE;
-        push_quad_y(&vl, 0.0f,        0.0f, 0.0f, w, d, 0.30f, 0.20f, 0.12f);
-        push_quad_y(&vl, WALL_HEIGHT, 0.0f, 0.0f, w, d, 0.08f, 0.09f, 0.14f);
+        push_quad_y(&vl, 0.0f,        0.0f, 0.0f, w, d,  1.0f, 0.30f, 0.20f, 0.12f);
+        push_quad_y(&vl, WALL_HEIGHT, 0.0f, 0.0f, w, d, -1.0f, 0.08f, 0.09f, 0.14f);
     }
 
     /* Walls */

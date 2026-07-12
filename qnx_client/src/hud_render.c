@@ -18,13 +18,17 @@ void hud_push_quad(VertexList *vl, f32 x0, f32 y0, f32 x1, f32 y1,
     f32 nx0, ny0, nx1, ny1;
     px_to_ndc(x0, y0, win_w, win_h, &nx0, &ny0);
     px_to_ndc(x1, y1, win_w, win_h, &nx1, &ny1);
-    /* z=0 -- HUD is drawn with depth test disabled, see main.c */
-    vlist_push(vl, nx0, ny0, 0.0f, r, g, b);
-    vlist_push(vl, nx1, ny0, 0.0f, r, g, b);
-    vlist_push(vl, nx1, ny1, 0.0f, r, g, b);
-    vlist_push(vl, nx0, ny0, 0.0f, r, g, b);
-    vlist_push(vl, nx1, ny1, 0.0f, r, g, b);
-    vlist_push(vl, nx0, ny1, 0.0f, r, g, b);
+    /* z=0 -- HUD is drawn with depth test disabled, see main.c.
+     * Normal (0,0,1) is a dummy -- the HUD/entity shader program
+     * doesn't declare a_normal at all, so this is never read; it's
+     * only here because the vertex buffer layout is shared with the
+     * level geometry, which does use it. */
+    vlist_push(vl, nx0, ny0, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
+    vlist_push(vl, nx1, ny0, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
+    vlist_push(vl, nx1, ny1, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
+    vlist_push(vl, nx0, ny0, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
+    vlist_push(vl, nx1, ny1, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
+    vlist_push(vl, nx0, ny1, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
 }
 
 /* Standard 7-segment hardware display encoding -- universal, not

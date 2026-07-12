@@ -464,7 +464,28 @@ static int start_net_thread_with_scheduling(pthread_t *out_tid)
 }
 
 /* ------------------------------------------------------------------ */
-/* GLES2 shader pipeline -- unchanged from Stage 2a.                    */
+/* GLES2 shader pipeline.                                              */
+/*                                                                      */
+/* Two separate programs share the SAME GeoVertex buffer layout        */
+/* (pos+normal+color, 36 bytes/vertex):                                */
+/*   - "simple": flat per-vertex color, used for entities and the HUD/ */
+/*     menu (a zombie or a HUD digit shouldn't look like a brick wall, */
+/*     and 2D screen-space UI has no meaningful "normal" anyway).      */
+/*   - "level": adds a procedural brick pattern on wall-like faces,    */
+/*     used ONLY for the static level_vbo draw call. Distinguishing    */
+/*     "wall" from "floor/ceiling/platform" happens via the vertex     */
+/*     normal (|normal.y| close to 1 = horizontal-ish surface, close   */
+/*     to 0 = vertical wall face) rather than needing a whole second   */
+/*     vertex buffer or a per-vertex flag.                             */
+/*                                                                      */
+/* No texture image anywhere -- the brick pattern is generated purely  */
+/* from world position math in the fragment shader, same "zero asset   */
+/* pipeline" approach as the rest of this renderer (7-segment HUD       */
+/* digits, procedural ramp meshes, etc.). Inspired by QNX's own         */
+/* gles2-maze sample (uniform mat4 mvp; attribute position/color;      */
+/* varying color; gl_FragColor = vcolor * texture2D(...)) -- same       */
+/* "multiply a base color by a per-fragment pattern" idea, just with    */
+/* a computed pattern instead of a sampled image.                       */
 /* ------------------------------------------------------------------ */
 static const char *VERTEX_SHADER_SRC =
     "attribute vec3 a_position;\n"
@@ -483,6 +504,55 @@ static const char *FRAGMENT_SHADER_SRC =
     "    gl_FragColor = vec4(v_color, 1.0);\n"
     "}\n";
 
+static const char *LEVEL_VERTEX_SHADER_SRC =
+    "attribute vec3 a_position;\n"
+    "attribute vec3 a_normal;\n"
+    "attribute vec3 a_color;\n"
+    "uniform mat4 u_mvp;\n"
+    "varying vec3 v_color;\n"
+    "varying vec3 v_normal;\n"
+    "varying vec3 v_world_pos;\n"
+    "void main() {\n"
+    "    gl_Position = u_mvp * vec4(a_position, 1.0);\n"
+    "    v_color = a_color;\n"
+    "    v_normal = a_normal;\n"
+    "    v_world_pos = a_position;\n"
+    "}\n";
+
+static const char *LEVEL_FRAGMENT_SHADER_SRC =
+    "precision mediump float;\n"
+    "varying vec3 v_color;\n"
+    "varying vec3 v_normal;\n"
+    "varying vec3 v_world_pos;\n"
+    "void main() {\n"
+    "    float wallness = 1.0 - abs(v_normal.y);\n"
+    /* Pseudo-UV for axis-aligned box geometry: every wall face has
+     * exactly one of world x/z roughly constant across the face and
+     * the other varying along its length -- summing them gives a
+     * cheap single coordinate that varies correctly along the wall
+     * regardless of whether it runs north-south or east-west, with no
+     * per-vertex UV attribute needed. */
+    "    float u = v_world_pos.x + v_world_pos.z;\n"
+    "    float v = v_world_pos.y;\n"
+    "    float brick_w = 1.0;\n"
+    "    float brick_h = 0.5;\n"
+    "    float mortar = 0.06;\n"
+    "    float row = floor(v / brick_h);\n"
+    "    float row_offset = mod(row, 2.0) * 0.5 * brick_w;\n"
+    "    float bx = fract((u + row_offset) / brick_w);\n"
+    "    float by = fract(v / brick_h);\n"
+    "    float mortar_line = clamp(step(bx, mortar) + step(1.0 - mortar, bx) +\n"
+    "                               step(by, mortar) + step(1.0 - mortar, by), 0.0, 1.0);\n"
+    /* cheap per-brick tint variation so bricks aren't perfectly
+     * uniform -- a sine-based hash, not real noise, but enough to
+     * break up the flatness the person asked about */
+    "    float brick_id = floor((u + row_offset) / brick_w) + row * 13.0;\n"
+    "    float tint = 0.92 + 0.08 * fract(sin(brick_id * 12.9898) * 43758.5453);\n"
+    "    vec3 brick_color = v_color * tint * (1.0 - mortar_line * 0.55);\n"
+    "    vec3 final_color = mix(v_color, brick_color, wallness);\n"
+    "    gl_FragColor = vec4(final_color, 1.0);\n"
+    "}\n";
+
 static GLuint compile_shader(GLenum type, const char *src)
 {
     GLuint shader = glCreateShader(type);
@@ -499,13 +569,13 @@ static GLuint compile_shader(GLenum type, const char *src)
     return shader;
 }
 
-static GLuint build_shader_program(GLint *out_mvp_loc, GLint *out_pos_loc, GLint *out_color_loc)
+static GLuint build_shader_program(const char *vs_src, const char *fs_src, GLint *out_mvp_loc)
 {
     GLuint vs, fs, prog;
     GLint  ok;
 
-    vs = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER_SRC);
-    fs = compile_shader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER_SRC);
+    vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+    fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
     if (!vs || !fs) return 0;
 
     prog = glCreateProgram();
@@ -520,12 +590,13 @@ static GLuint build_shader_program(GLint *out_mvp_loc, GLint *out_pos_loc, GLint
         return 0;
     }
 
-    *out_pos_loc   = glGetAttribLocation(prog, "a_position");
-    *out_color_loc = glGetAttribLocation(prog, "a_color");
-    *out_mvp_loc   = glGetUniformLocation(prog, "u_mvp");
+    *out_mvp_loc = glGetUniformLocation(prog, "u_mvp");
     return prog;
 }
 
+/* GeoVertex is laid out {pos(3), normal(3), color(3)} regardless of
+ * which program draws it -- these two draw functions differ only in
+ * whether they also bind a_normal, not in the underlying buffer. */
 static void draw_vertex_list(GLuint vbo, GLint pos_loc, GLint color_loc, int vertex_count)
 {
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -533,7 +604,23 @@ static void draw_vertex_list(GLuint vbo, GLint pos_loc, GLint color_loc, int ver
                           sizeof(GeoVertex), (const void *)0);
     glEnableVertexAttribArray((GLuint)pos_loc);
     glVertexAttribPointer((GLuint)color_loc, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(GeoVertex), (const void *)(6 * sizeof(f32)));
+    glEnableVertexAttribArray((GLuint)color_loc);
+    glDrawArrays(GL_TRIANGLES, 0, vertex_count);
+}
+
+static void draw_vertex_list_lit(GLuint vbo, GLint pos_loc, GLint normal_loc, GLint color_loc,
+                                 int vertex_count)
+{
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glVertexAttribPointer((GLuint)pos_loc, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(GeoVertex), (const void *)0);
+    glEnableVertexAttribArray((GLuint)pos_loc);
+    glVertexAttribPointer((GLuint)normal_loc, 3, GL_FLOAT, GL_FALSE,
                           sizeof(GeoVertex), (const void *)(3 * sizeof(f32)));
+    glEnableVertexAttribArray((GLuint)normal_loc);
+    glVertexAttribPointer((GLuint)color_loc, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(GeoVertex), (const void *)(6 * sizeof(f32)));
     glEnableVertexAttribArray((GLuint)color_loc);
     glDrawArrays(GL_TRIANGLES, 0, vertex_count);
 }
@@ -986,8 +1073,9 @@ int main(int argc, char **argv)
 
     pthread_t net_tid;
 
-    GLuint  prog;
+    GLuint  prog, level_prog;
     GLint   pos_loc, color_loc, mvp_loc;
+    GLint   level_pos_loc, level_normal_loc, level_color_loc, level_mvp_loc;
     GLuint  level_vbo, entity_vbo, hud_vbo;
     int     level_vertex_count;
     VertexList level_geo;
@@ -1099,8 +1187,20 @@ int main(int argc, char **argv)
     printf("[gl] GL_RENDERER: %s\n", (const char *)glGetString(GL_RENDERER));
 
     /* ---- shader + static level geometry ---- */
-    prog = build_shader_program(&mvp_loc, &pos_loc, &color_loc);
+    prog = build_shader_program(VERTEX_SHADER_SRC, FRAGMENT_SHADER_SRC, &mvp_loc);
     if (!prog) { fprintf(stderr, "Shader setup failed\n"); return 1; }
+    pos_loc   = glGetAttribLocation(prog, "a_position");
+    color_loc = glGetAttribLocation(prog, "a_color");
+
+    /* Second program, level geometry (walls/floor/ceiling/platforms/
+     * ramps) only -- see the comment above LEVEL_FRAGMENT_SHADER_SRC
+     * for why this is separate from the simple program above rather
+     * than one program handling everything. */
+    level_prog = build_shader_program(LEVEL_VERTEX_SHADER_SRC, LEVEL_FRAGMENT_SHADER_SRC, &level_mvp_loc);
+    if (!level_prog) { fprintf(stderr, "Level shader setup failed\n"); return 1; }
+    level_pos_loc    = glGetAttribLocation(level_prog, "a_position");
+    level_normal_loc = glGetAttribLocation(level_prog, "a_normal");
+    level_color_loc  = glGetAttribLocation(level_prog, "a_color");
 
     level_geo = build_level_geometry();
     level_vertex_count = level_geo.count;
@@ -1274,12 +1374,19 @@ int main(int argc, char **argv)
                 glClearColor(0.02f, 0.02f, 0.03f, 1.0f);
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+                /* 3D pass, level: separate program with the procedural
+                 * brick pattern (see LEVEL_FRAGMENT_SHADER_SRC) --
+                 * walls/floor/ceiling/platforms/ramps only. */
+                glUseProgram(level_prog);
+                glUniformMatrix4fv(level_mvp_loc, 1, GL_FALSE, mvp.m);
+                draw_vertex_list_lit(level_vbo, level_pos_loc, level_normal_loc, level_color_loc,
+                                     level_vertex_count);
+
+                /* 3D pass, entities: back to the simple flat-color
+                 * program -- a zombie or player marker shouldn't get
+                 * the brick treatment. */
                 glUseProgram(prog);
-
-                /* 3D pass: level (static) + entities (rebuilt this frame) */
                 glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, mvp.m);
-                draw_vertex_list(level_vbo, pos_loc, color_loc, level_vertex_count);
-
                 if (entity_geo.count > 0) {
                     glBindBuffer(GL_ARRAY_BUFFER, entity_vbo);
                     glBufferData(GL_ARRAY_BUFFER,
@@ -1290,7 +1397,9 @@ int main(int argc, char **argv)
                 vertex_list_free(&entity_geo);
 
                 /* 2D HUD pass: identity MVP (hud_render.c emits NDC
-                 * directly), depth test off so it always draws on top. */
+                 * directly), depth test off so it always draws on top.
+                 * Still the simple program -- HUD digits/crosshair stay
+                 * flat-colored, no brick pattern. */
                 glDisable(GL_DEPTH_TEST);
                 glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, identity.m);
                 if (hud_geo.count > 0) {

@@ -8,7 +8,60 @@ This client is a third, independent way to play: QNX becomes the
 renderer as well as the server, using QNX's own native APIs instead
 of Godot.
 
-## Status: ESC returns to menu, ramp/platform height fixed
+## Status: Procedural brick pattern on walls
+
+Walls (and any other vertical-ish level surface) now get a real
+procedural brick pattern instead of a single flat color, inspired by
+QNX's own `gles2-maze` sample -- same core idea (`gl_FragColor = vcolor
+* pattern`), but the pattern is generated from math in the fragment
+shader rather than a sampled texture image, keeping this renderer's
+"zero asset pipeline" approach intact (no `.tga`, no embedded texture
+header, nothing to load at startup).
+
+**How walls get distinguished from floor/ceiling/platforms in one draw
+call:** every vertex now carries a real face normal (previously
+`GeoVertex` had no normal at all -- purely flat per-vertex color). The
+level fragment shader uses `1.0 - abs(normal.y)` as a "wallness"
+factor: vertical wall faces (normal mostly horizontal) get the full
+brick pattern, horizontal floor/ceiling/platform faces (normal mostly
+vertical) stay flat, all from the same `level_vbo` draw call with no
+per-tile flag needed.
+
+**Two shader programs, not one:** this project reuses a single flat-
+color shader for the 3D level, entities (player/zombie/pickup boxes),
+*and* the 2D HUD/menu overlay -- adding the brick effect to that one
+shader would have made zombies and HUD digits look like brick walls
+too. Added a second program (`level_prog`) used only for the
+`level_vbo` draw call; entities and HUD stay on the original simple
+program, unchanged.
+
+**Verified with a real GLSL compiler**, not just "it compiled in my
+stub headers": installed `glslang-tools` and validated the actual
+extracted shader source (not the escaped C string, the real GLSL) --
+zero errors compiling each stage, zero errors linking each
+vertex/fragment pair. Also verified the new face-normal math
+numerically: every vertex's normal is unit length, wall faces get
+exactly axis-aligned normals, and rotated ramp faces get correctly
+tilted (non-axis-aligned) normals that stay unit length and pair up
+antiparallel on opposite faces.
+
+### Files changed this round
+
+- `src/level_geo.h` -- `GeoVertex` gained `nx,ny,nz`; `vlist_push()`
+  and `push_box()` signatures updated.
+- `src/level_geo.c` -- `emit_box_faces()` now takes a per-face normal
+  table; `push_box()` uses the fixed axis-aligned table;
+  `push_box_transformed()` rotates it by the same world transform
+  used for vertices (via a transform-point-minus-origin trick to
+  strip out translation); `push_quad_y()` takes a normal_y parameter.
+- `src/hud_render.c` -- `hud_push_quad()`'s `vlist_push()` calls
+  updated with a dummy normal (unused by the HUD's shader program).
+- `src/main.c` -- added `LEVEL_VERTEX_SHADER_SRC`/
+  `LEVEL_FRAGMENT_SHADER_SRC` with the procedural brick pattern;
+  `build_shader_program()` generalized to take shader sources as
+  parameters; added `draw_vertex_list_lit()` for the 3-attribute
+  level program; render loop now switches programs around the
+  `level_vbo` draw call specifically.
 
 **ESC now returns to the menu instead of quitting**, and you can
 replay/restart from there. This needed a real distinction that didn't

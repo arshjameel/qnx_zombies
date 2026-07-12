@@ -21,6 +21,13 @@
 
 typedef struct {
     f32 x, y, z;
+    f32 nx, ny, nz;   /* face normal, world-space (rotated for push_box_transformed).
+                       * Lets the level shader tell vertical wall faces (ny ~ 0) apart
+                       * from horizontal floor/ceiling/platform faces (|ny| ~ 1) to
+                       * apply the brick pattern only where it belongs. Unused by the
+                       * entity/HUD shader (different program, doesn't declare a_normal
+                       * at all) -- present in the buffer either way since all vertex
+                       * lists share one GeoVertex layout. */
     f32 r, g, b;
 } GeoVertex;
 
@@ -39,7 +46,7 @@ void       vertex_list_free(VertexList *vl);
 /* Exposed so entity rendering (zombies, other players) can reuse the
  * same box-drawing code rather than duplicating it -- one flat-colored
  * axis-aligned box, given HALF-extents. */
-void vlist_push(VertexList *vl, f32 x, f32 y, f32 z, f32 r, f32 g, f32 b);
+void vlist_push(VertexList *vl, f32 x, f32 y, f32 z, f32 nx, f32 ny, f32 nz, f32 r, f32 g, f32 b);
 void push_box(VertexList *vl, f32 cx, f32 cy, f32 cz, f32 hx, f32 hy, f32 hz,
              f32 r, f32 g, f32 b);
 
