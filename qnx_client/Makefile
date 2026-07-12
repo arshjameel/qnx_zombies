@@ -29,8 +29,8 @@ else
     CFLAGS += -g -O0 -fno-builtin
 endif
 
-SRCS := src/main.c src/level_geo.c src/hud_render.c $(TOP_SRC)/net.c $(TOP_SRC)/map.c
-OBJS := $(BUILD_DIR)/main.o $(BUILD_DIR)/level_geo.o $(BUILD_DIR)/hud_render.o \
+SRCS := src/main.c src/level_geo.c src/hud_render.c src/text_render.c $(TOP_SRC)/net.c $(TOP_SRC)/map.c
+OBJS := $(BUILD_DIR)/main.o $(BUILD_DIR)/level_geo.o $(BUILD_DIR)/hud_render.o $(BUILD_DIR)/text_render.o \
         $(BUILD_DIR)/net.o $(BUILD_DIR)/map.o
 
 .PHONY: all clean rebuild deploy run
@@ -51,6 +51,10 @@ $(BUILD_DIR)/level_geo.o: src/level_geo.c
 	$(QCC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/hud_render.o: src/hud_render.c
+	@mkdir -p $(dir $@)
+	$(QCC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/text_render.o: src/text_render.c
 	@mkdir -p $(dir $@)
 	$(QCC) $(CFLAGS) -c $< -o $@
 

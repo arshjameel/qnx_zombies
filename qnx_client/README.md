@@ -8,7 +8,92 @@ This client is a third, independent way to play: QNX becomes the
 renderer as well as the server, using QNX's own native APIs instead
 of Godot.
 
-## Status: Procedural brick pattern on walls
+## Status: Real text rendering (Public Pixel font)
+
+The menu now shows an actual title ("DOOM QNX COOP") and real text
+labels on each option ("SOLO"/"COOP"/"QUIT"), not just numbers -- the
+first real English text anywhere in this client. Everything before
+this (HUD health/ammo/wave, the menu) had to make do with
+`hud_render.c`'s 7-segment digits, since there was no font rendering
+of any kind.
+
+**Font used:** [Public Pixel](https://github.com/ggbotnet/fonts-cc0)
+by GGBotNet, **CC0 1.0 Universal** (public domain -- no attribution
+required, safe to embed and redistribute). Confirmed monospaced: every
+printable ASCII character has an identical 16px advance width at the
+render size used here, which is what makes the whole atlas layout and
+text-cursor math this simple (no per-glyph width table needed at all).
+
+**How it's embedded -- same "no runtime asset loading" approach as
+everything else in this renderer:** `tools/make_font_atlas.py`
+rasterizes the actual `.ttf` into a 256x96 single-channel bitmap (a
+16x6 grid of 16x16 glyph cells covering ASCII 32-126) and writes it
+out as `src/font_atlas.h`, a plain `unsigned char` array -- the exact
+same idea as QNX's own `gles2-maze` sample embedding `brick_wall.tga`
+as `brick_wall.h` via `xxd -i`, just pre-decoded to raw pixels instead
+of a wrapped image file, so there's no TGA/PNG parser needed in the
+C code at all. The `.ttf` itself and Pillow (the Python rendering
+library) are **not** part of the qnx_client build -- only run
+`make_font_atlas.py` again if you want to regenerate the atlas (a
+different font, a different character range, a different size).
+
+**A third rendering pipeline, alongside the existing two:** text needs
+a texture and UV coordinates; neither the "simple" (flat-colored
+entities/HUD/menu-boxes) nor "level" (walls with the brick pattern)
+program has any use for those, and adding them there would've bloated
+every other vertex in the renderer for a feature only text needs. So
+text gets its own vertex format (`TextVertex`: position + texcoord +
+color, no normal), its own growable list type (`TextVertexList`), and
+its own shader program (`text_prog`) that samples the atlas with a
+hard alpha cutout (`discard` below 0.5 coverage) rather than smooth
+blending -- keeps the crisp pixel-font edges and avoids needing to
+enable `GL_BLEND` anywhere in a renderer that otherwise relies
+entirely on depth testing.
+
+**Verified, not just "it compiled":**
+- Confirmed via `font.getlength()` that the source font is genuinely
+  monospaced before committing to a fixed-grid atlas layout with no
+  kerning table.
+- Confirmed the rasterized glyphs are essentially pure binary coverage
+  (checked actual pixel values across the whole atlas), justifying the
+  hard-cutout fragment shader instead of smooth alpha blending.
+- Numerically checked the UV-lookup math against a known character
+  ('A' → atlas cell (1,2) → exact expected `(u,v)` pixel-to-texcoord
+  values), not just eyeballed.
+- Validated both new shader stages through a real GLSL compiler
+  (`glslang-tools`), individually and linked as a pair -- zero errors,
+  same discipline as the wall-texturing shaders.
+- Ran the actual compiled binary end-to-end against the real
+  functional GL/EGL/Screen stubs built earlier in this project: font
+  texture uploads, menu renders with real text, E-key transitions to
+  gameplay, all with zero crashes.
+
+**Scope note:** the kill feed from the original ask isn't in this
+round. It needs its own design -- a way for the client to actually
+learn about kill events (server broadcasting them, or the client
+inferring them from zombie/player state transitions) plus a
+scrolling/timed message queue -- which is a meaningfully separate
+piece of work from "can this client render text at all." This round
+proves the text pipeline works end to end; the kill feed is a clean
+next step once you want it.
+
+### Files changed/added this round
+
+- `tools/make_font_atlas.py` -- new. Regenerates `src/font_atlas.h`
+  from a `.ttf`.
+- `src/font_atlas.h` -- new. Embedded Public Pixel atlas (CC0).
+- `src/text_render.h` / `src/text_render.c` -- new (replaces the old
+  unused/uncompiled 5x7 hand-drawn letter attempt of the same name,
+  which was never wired into the Makefile). `text_push_string()`,
+  `text_string_width()`.
+- `src/main.c` -- added `TEXT_VERTEX_SHADER_SRC`/
+  `TEXT_FRAGMENT_SHADER_SRC`; a third `glUseProgram` target
+  (`text_prog`); font atlas texture upload at startup; `draw_text()`;
+  `build_menu_geometry()` now also returns a `TextVertexList` (title +
+  option labels) via an out-parameter.
+- `Makefile` -- `text_render.c` added to the actual build (`OBJS` +
+  its explicit compile rule) -- the old file existed on disk but was
+  never actually compiled.
 
 Walls (and any other vertical-ish level surface) now get a real
 procedural brick pattern instead of a single flat color, inspired by

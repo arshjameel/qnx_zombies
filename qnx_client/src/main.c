@@ -110,6 +110,8 @@
 #include "mat4.h"
 #include "level_geo.h"
 #include "hud_render.h"
+#include "text_render.h"
+#include "font_atlas.h"
 
 #define WINDOW_W 1280   /* fallback only -- actual size is auto-detected from
                          * the display at startup, see main()'s Screen setup */
@@ -553,6 +555,40 @@ static const char *LEVEL_FRAGMENT_SHADER_SRC =
     "    gl_FragColor = vec4(final_color, 1.0);\n"
     "}\n";
 
+/* Third program, text only -- see text_render.h for why this needs
+ * its own vertex format (position+texcoord+color, no normal) rather
+ * than reusing either of the two above. Position is already NDC
+ * (text_render.c converts on the CPU side, same convention as
+ * hud_render.c's 2D elements), so no MVP multiply is needed here at
+ * all -- simpler than carrying an always-identity uniform through. */
+static const char *TEXT_VERTEX_SHADER_SRC =
+    "attribute vec2 a_position;\n"
+    "attribute vec2 a_texcoord;\n"
+    "attribute vec3 a_color;\n"
+    "varying vec2 v_texcoord;\n"
+    "varying vec3 v_color;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "    v_texcoord = a_texcoord;\n"
+    "    v_color = a_color;\n"
+    "}\n";
+
+static const char *TEXT_FRAGMENT_SHADER_SRC =
+    "precision mediump float;\n"
+    "uniform sampler2D u_tex;\n"
+    "varying vec2 v_texcoord;\n"
+    "varying vec3 v_color;\n"
+    "void main() {\n"
+    /* Hard cutout rather than smooth alpha blending -- the atlas is
+     * essentially binary coverage already (see make_font_atlas.py's
+     * verified pixel-value check), and this avoids needing to enable
+     * GL_BLEND / manage draw order anywhere else in this renderer,
+     * which uses depth testing for everything else instead. */
+    "    float a = texture2D(u_tex, v_texcoord).a;\n"
+    "    if (a < 0.5) discard;\n"
+    "    gl_FragColor = vec4(v_color, 1.0);\n"
+    "}\n";
+
 static GLuint compile_shader(GLenum type, const char *src)
 {
     GLuint shader = glCreateShader(type);
@@ -625,8 +661,37 @@ static void draw_vertex_list_lit(GLuint vbo, GLint pos_loc, GLint normal_loc, GL
     glDrawArrays(GL_TRIANGLES, 0, vertex_count);
 }
 
-/* ------------------------------------------------------------------ */
-/* Camera + input state                                                */
+/* Uploads a TextVertexList to text_vbo and draws it -- unlike the two
+ * functions above, this one also binds the font atlas texture (text
+ * always uses exactly one texture, so there's no point taking it as
+ * a parameter the way vbo/locs are). Caller is responsible for
+ * glUseProgram(text_prog) beforehand, same convention as the other
+ * two draw functions relying on the right program already being
+ * active. */
+static void draw_text(GLuint text_vbo, GLuint font_texture, GLint pos_loc,
+                      GLint texcoord_loc, GLint color_loc, GLint tex_loc,
+                      const TextVertexList *tl)
+{
+    if (tl->count <= 0) return;
+    glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(TextVertex) * (size_t)tl->count),
+                tl->verts, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer((GLuint)pos_loc, 2, GL_FLOAT, GL_FALSE,
+                          sizeof(TextVertex), (const void *)0);
+    glEnableVertexAttribArray((GLuint)pos_loc);
+    glVertexAttribPointer((GLuint)texcoord_loc, 2, GL_FLOAT, GL_FALSE,
+                          sizeof(TextVertex), (const void *)(2 * sizeof(f32)));
+    glEnableVertexAttribArray((GLuint)texcoord_loc);
+    glVertexAttribPointer((GLuint)color_loc, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(TextVertex), (const void *)(4 * sizeof(f32)));
+    glEnableVertexAttribArray((GLuint)color_loc);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, font_texture);
+    glUniform1i(tex_loc, 0);
+
+    glDrawArrays(GL_TRIANGLES, 0, tl->count);
+}
 /* ------------------------------------------------------------------ */
 typedef struct {
     f32 x, y, z;
@@ -1017,7 +1082,7 @@ static VertexList build_hud_geometry(int win_w, int win_h)
  * other two dimmed, rather than drawing a separate border/highlight
  * box -- simpler, and avoids the exact seam/z-fighting-in-2D
  * questions a separate outline box would raise. */
-static VertexList build_menu_geometry(int win_w, int win_h, int selection)
+static VertexList build_menu_geometry(int win_w, int win_h, int selection, TextVertexList *out_text)
 {
     VertexList vl;
     const f32 box_w = 320.0f, box_h = 70.0f, spacing = 100.0f;
@@ -1026,11 +1091,27 @@ static VertexList build_menu_geometry(int win_w, int win_h, int selection)
         { 0.25f, 0.45f, 0.85f },   /* 2: Coop -- blue */
         { 0.65f, 0.20f, 0.20f },   /* 3: Quit -- red */
     };
+    static const char *labels[MENU_OPTION_COUNT] = { "SOLO", "COOP", "QUIT" };
     f32 first_top = (f32)win_h * 0.35f;
     f32 cx = (f32)win_w * 0.5f;
     int i;
 
     memset(&vl, 0, sizeof(vl));
+    memset(out_text, 0, sizeof(*out_text));
+
+    /* Title -- centered above the option boxes. This is the first
+     * actual text anywhere in this client; everything before this
+     * (HUD health/ammo/wave, menu options) had to make do with
+     * hud_render.c's 7-segment digits since there was no font
+     * rendering at all. See text_render.h / font_atlas.h. */
+    {
+        const char *title = "DOOM QNX COOP";
+        f32 title_char_w = 28.0f, title_char_h = 40.0f;
+        f32 title_w = text_string_width(title, title_char_w);
+        f32 title_top = first_top - 90.0f;
+        text_push_string(out_text, title, cx - title_w * 0.5f, title_top,
+                         title_char_w, title_char_h, win_w, win_h, 0.85f, 0.85f, 0.95f);
+    }
 
     for (i = 0; i < MENU_OPTION_COUNT; i++) {
         f32 top    = first_top + (f32)i * spacing;
@@ -1042,12 +1123,22 @@ static VertexList build_menu_geometry(int win_w, int win_h, int selection)
         f32 r = base_colors[i][0] * dim;
         f32 g = base_colors[i][1] * dim;
         f32 b = base_colors[i][2] * dim;
+        f32 label_char_w = 24.0f, label_char_h = 34.0f;
+        f32 label_w = text_string_width(labels[i], label_char_w);
 
         hud_push_quad(&vl, left, top, right, bottom, win_w, win_h, r, g, b);
 
-        /* Number, left-aligned inside the box, vertically centered. */
+        /* Number, left-aligned inside the box, vertically centered --
+         * kept alongside the new text label as a quick-select hint
+         * (matches whatever key you'd press), not replaced by it. */
         hud_push_digit(&vl, i + 1, left + 24.0f, top + (box_h - 40.0f) * 0.5f,
                        24.0f, 40.0f, win_w, win_h, 1.0f, 1.0f, 1.0f);
+
+        /* Text label, centered in the remaining space to the right of
+         * the number. */
+        text_push_string(out_text, labels[i], cx + 20.0f - label_w * 0.5f,
+                         top + (box_h - label_char_h) * 0.5f,
+                         label_char_w, label_char_h, win_w, win_h, 1.0f, 1.0f, 1.0f);
     }
 
     return vl;
@@ -1073,10 +1164,12 @@ int main(int argc, char **argv)
 
     pthread_t net_tid;
 
-    GLuint  prog, level_prog;
+    GLuint  prog, level_prog, text_prog;
     GLint   pos_loc, color_loc, mvp_loc;
     GLint   level_pos_loc, level_normal_loc, level_color_loc, level_mvp_loc;
-    GLuint  level_vbo, entity_vbo, hud_vbo;
+    GLint   text_pos_loc, text_texcoord_loc, text_color_loc, text_tex_loc;
+    GLuint  level_vbo, entity_vbo, hud_vbo, text_vbo;
+    GLuint  font_texture;
     int     level_vertex_count;
     VertexList level_geo;
 
@@ -1202,6 +1295,37 @@ int main(int argc, char **argv)
     level_normal_loc = glGetAttribLocation(level_prog, "a_normal");
     level_color_loc  = glGetAttribLocation(level_prog, "a_color");
 
+    /* Third program, real English text via the Public Pixel font
+     * atlas -- see text_render.h for why this is its own pipeline
+     * rather than extending either program above. mvp_loc is unused
+     * here (the text vertex shader has no u_mvp uniform at all, see
+     * TEXT_VERTEX_SHADER_SRC), the return value is just discarded. */
+    {
+        GLint unused_mvp_loc;
+        text_prog = build_shader_program(TEXT_VERTEX_SHADER_SRC, TEXT_FRAGMENT_SHADER_SRC, &unused_mvp_loc);
+    }
+    if (!text_prog) { fprintf(stderr, "Text shader setup failed\n"); return 1; }
+    text_pos_loc      = glGetAttribLocation(text_prog, "a_position");
+    text_texcoord_loc = glGetAttribLocation(text_prog, "a_texcoord");
+    text_color_loc    = glGetAttribLocation(text_prog, "a_color");
+    text_tex_loc      = glGetUniformLocation(text_prog, "u_tex");
+
+    /* Font atlas: single-channel (GL_ALPHA) texture, uploaded once at
+     * startup from the embedded font_atlas.h -- never loaded from a
+     * file on the target, same "everything is compiled in" approach
+     * as the rest of this renderer. NEAREST filtering keeps the
+     * pixel-font glyphs crisp instead of blurring them; CLAMP_TO_EDGE
+     * avoids wrap-around bleeding at glyph cell edges. */
+    glGenTextures(1, &font_texture);
+    glBindTexture(GL_TEXTURE_2D, font_texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, FONT_ATLAS_W, FONT_ATLAS_H_PX, 0,
+                GL_ALPHA, GL_UNSIGNED_BYTE, font_atlas_pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenBuffers(1, &text_vbo);
+
     level_geo = build_level_geometry();
     level_vertex_count = level_geo.count;
     glGenBuffers(1, &level_vbo);
@@ -1307,7 +1431,8 @@ int main(int argc, char **argv)
                 }
 
                 if (g_running) {
-                    VertexList menu_geo = build_menu_geometry(win_w, win_h, menu_selection);
+                    TextVertexList menu_text;
+                    VertexList menu_geo = build_menu_geometry(win_w, win_h, menu_selection, &menu_text);
                     Mat4 identity = mat4_identity();
 
                     glViewport(0, 0, win_w, win_h);
@@ -1325,6 +1450,12 @@ int main(int argc, char **argv)
                         draw_vertex_list(hud_vbo, pos_loc, color_loc, menu_geo.count);
                     }
                     vertex_list_free(&menu_geo);
+
+                    glUseProgram(text_prog);
+                    draw_text(text_vbo, font_texture, text_pos_loc, text_texcoord_loc,
+                             text_color_loc, text_tex_loc, &menu_text);
+                    text_vlist_free(&menu_text);
+
                     glEnable(GL_DEPTH_TEST);
 
                     eglSwapBuffers(egl_disp, egl_surf);
