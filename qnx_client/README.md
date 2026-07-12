@@ -8,7 +8,64 @@ This client is a third, independent way to play: QNX becomes the
 renderer as well as the server, using QNX's own native APIs instead
 of Godot.
 
-## Status: Real text rendering (Public Pixel font)
+## Status: HUD labels + hit feed
+
+The HUD now has real text captions ("HP", "AMMO", "WAVE", "ZOMBIES")
+above each numeric readout instead of bare numbers, and a live hit
+feed in the top-right -- both built on last round's text pipeline.
+
+**The hit feed is ported directly from `HUD.gd`'s `_on_hit_event()`,
+case for case**, so both clients read the same way in coop: EVERY
+successful hit gets a feed line, not just kills (a "hit feed" more
+than a strict "kill feed", matching the existing Godot behavior
+rather than inventing new scope). Message text and color both match:
+
+| Event | Message | Color |
+|---|---|---|
+| Headshot on zombie | `[HEADSHOT] PLAYER n HIT ZOMBIE n` | orange |
+| Normal hit on zombie | `PLAYER n HIT ZOMBIE n` | light green |
+| Zombie hits a player | `ZOMBIE MAULED PLAYER n` | red |
+| Player hits a player | `PLAYER n HIT PLAYER n` | yellow |
+
+Up to 4 lines, 5 second lifetime each, oldest drops off the top when
+a 5th arrives -- `FEED_MAX_LINES`/`FEED_TTL` match `HUD.gd`'s own
+constants exactly.
+
+**Where the data comes from -- a protocol gap that had to be closed
+first:** `qnx_client` had never parsed `PKT_HIT` at all before this
+round (confirmed by grep -- zero references anywhere in `main.c`).
+The network thread's receive loop only ever looked for `PKT_STATE`;
+any hit notification the server sent was silently ignored. Added the
+missing branch alongside it.
+
+**Thread safety:** hits arrive on the network thread; the feed needs
+to age and render on the render thread. `push_feed_entry()` (net
+thread, called on `PKT_HIT`) and `get_feed_snapshot()` (render
+thread, called once per frame with that frame's `dt`) both lock
+`g_state`'s existing mutex -- same pattern already used for
+players/zombies/pickups, just one more field under the same lock
+rather than a new synchronization mechanism.
+
+**Verified:**
+- Isolated unit test of the feed queue logic alone (no GL/EGL/Screen
+  dependency at all): pushed 6 entries through a 4-slot FIFO and
+  confirmed the correct 4 survive in the correct order, advanced time
+  past the TTL and confirmed all 4 correctly expire, then confirmed
+  pushing again after a full expiry still works cleanly.
+- Ran the actual compiled binary against the actual server for 6
+  seconds straight through gameplay -- the new label/feed code runs
+  every single frame (even with zero active feed entries, the normal
+  steady state) with zero crashes.
+
+### Files changed this round
+
+- `src/main.c` -- added `FeedEntry`/`FEED_MAX_LINES`/`FEED_TTL` and a
+  `feed[]`/`feed_count` field on the existing `g_state`;
+  `push_feed_entry()`/`get_feed_snapshot()`; a new `PKT_HIT` branch in
+  the network thread's receive loop (message/color logic ported from
+  `HUD.gd`); `build_hud_geometry()` gained `dt` and a `TextVertexList*`
+  out-parameter for labels + feed text; render loop draws that text
+  via `text_prog` alongside the existing HUD draw.
 
 The menu now shows an actual title ("DOOM QNX COOP") and real text
 labels on each option ("SOLO"/"COOP"/"QUIT"), not just numbers -- the

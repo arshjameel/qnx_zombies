@@ -247,6 +247,20 @@ typedef struct {
     f32 x, y;
 } RenderPickup;
 
+/* Hit feed -- every PKT_HIT the network thread receives becomes one
+ * of these, matching Godot's HUD.gd exactly: EVERY successful hit is
+ * feed-worthy, not just fatal ones (a "hit feed", not strictly a
+ * "kill feed", despite the common name). FEED_MAX_LINES/FEED_TTL
+ * match HUD.gd's own constants for a consistent feel across clients. */
+#define FEED_MAX_LINES 4
+#define FEED_TTL       5.0f
+
+typedef struct {
+    char text[80];
+    f32  r, g, b;
+    f32  ttl;
+} FeedEntry;
+
 typedef struct {
     pthread_mutex_t lock;
     RenderPlayer players[NET_MAX_PLAYERS];
@@ -262,9 +276,60 @@ typedef struct {
                                   * player -- see reconcile_camera() in main() */
     u8           my_health;
     u8           my_ammo;
+    FeedEntry    feed[FEED_MAX_LINES];   /* [0] = oldest still-alive, matching
+                                          * HUD.gd's array order (oldest at
+                                          * the top of the on-screen stack) */
+    int          feed_count;
 } SharedGameState;
 
 static SharedGameState g_state;
+
+/* Appends one feed line (called from the network thread on PKT_HIT).
+ * If already at FEED_MAX_LINES, drops the oldest and shifts the rest
+ * up by one -- same FIFO-capped-at-4 behavior as HUD.gd's
+ * _feed_lines.append() + pop_front(). */
+static void push_feed_entry(const char *text, f32 r, f32 g, f32 b)
+{
+    pthread_mutex_lock(&g_state.lock);
+    if (g_state.feed_count >= FEED_MAX_LINES) {
+        int i;
+        for (i = 1; i < FEED_MAX_LINES; i++) g_state.feed[i - 1] = g_state.feed[i];
+        g_state.feed_count = FEED_MAX_LINES - 1;
+    }
+    {
+        FeedEntry *e = &g_state.feed[g_state.feed_count];
+        strncpy(e->text, text, sizeof(e->text) - 1);
+        e->text[sizeof(e->text) - 1] = '\0';
+        e->r = r; e->g = g; e->b = b;
+        e->ttl = FEED_TTL;
+        g_state.feed_count++;
+    }
+    pthread_mutex_unlock(&g_state.lock);
+}
+
+/* Ages every active entry by dt, drops any that expired, and returns
+ * a snapshot of what's left (oldest first) for the render thread to
+ * draw -- called once per frame, matching HUD.gd's _process(delta)
+ * ttl-decrement-and-filter loop. out must have room for
+ * FEED_MAX_LINES entries. */
+static int get_feed_snapshot(FeedEntry *out, f32 dt)
+{
+    int i, w, n;
+    pthread_mutex_lock(&g_state.lock);
+    for (i = 0; i < g_state.feed_count; i++) g_state.feed[i].ttl -= dt;
+    w = 0;
+    for (i = 0; i < g_state.feed_count; i++) {
+        if (g_state.feed[i].ttl > 0.0f) {
+            if (w != i) g_state.feed[w] = g_state.feed[i];
+            w++;
+        }
+    }
+    g_state.feed_count = w;
+    n = g_state.feed_count;
+    for (i = 0; i < n; i++) out[i] = g_state.feed[i];
+    pthread_mutex_unlock(&g_state.lock);
+    return n;
+}
 
 /* ------------------------------------------------------------------ */
 /* Networking thread                                                    */
@@ -400,6 +465,35 @@ static void *net_thread_main(void *arg)
                     g_state.has_my_state = 1;
                 }
                 pthread_mutex_unlock(&g_state.lock);
+            } else if (hdr->type == PKT_HIT && n >= (ssize_t)sizeof(PktHit)) {
+                /* Feed message + color per HUD.gd's _on_hit_event() --
+                 * matched case for case so the two clients read the
+                 * same way in coop. */
+                PktHit *hit = (PktHit *)buf;
+                char msg[80];
+                f32 r, g, b;
+
+                if (hit->victim_type == ENTITY_ZOMBIE) {
+                    if (hit->headshot) {
+                        snprintf(msg, sizeof(msg), "[HEADSHOT] PLAYER %d HIT ZOMBIE %d",
+                                hit->attacker_id, hit->victim_id);
+                        r = 0.95f; g = 0.6f; b = 0.1f;    /* orange */
+                    } else {
+                        snprintf(msg, sizeof(msg), "PLAYER %d HIT ZOMBIE %d",
+                                hit->attacker_id, hit->victim_id);
+                        r = 0.55f; g = 0.9f; b = 0.55f;   /* light green */
+                    }
+                } else {
+                    if (hit->attacker_id == ATTACKER_ZOMBIE) {
+                        snprintf(msg, sizeof(msg), "ZOMBIE MAULED PLAYER %d", hit->victim_id);
+                        r = 0.9f; g = 0.2f; b = 0.2f;     /* red */
+                    } else {
+                        snprintf(msg, sizeof(msg), "PLAYER %d HIT PLAYER %d",
+                                hit->attacker_id, hit->victim_id);
+                        r = 0.9f; g = 0.85f; b = 0.25f;   /* yellow */
+                    }
+                }
+                push_feed_entry(msg, r, g, b);
             }
         }
         portable_sleep_ms(50);
@@ -1024,15 +1118,19 @@ static f32 push_stat_ratio(VertexList *vl, int current, int max, f32 px, f32 py,
     return x - px;   /* total width, for right-aligning callers */
 }
 
-static VertexList build_hud_geometry(int win_w, int win_h)
+static VertexList build_hud_geometry(int win_w, int win_h, f32 dt, TextVertexList *out_text)
 {
     VertexList vl;
     u8  health, ammo, wave;
     int zombie_count;
     const f32 digit_w = 20.0f, digit_h = 32.0f;
-    f32 ammo_width;
+    const f32 label_w = 14.0f, label_h = 18.0f;
+    f32 ammo_width, ammo_label_w;
+    FeedEntry feed[FEED_MAX_LINES];
+    int feed_n, i;
 
     memset(&vl, 0, sizeof(vl));
+    memset(out_text, 0, sizeof(*out_text));
 
     pthread_mutex_lock(&g_state.lock);
     health       = g_state.my_health;
@@ -1043,15 +1141,15 @@ static VertexList build_hud_geometry(int win_w, int win_h)
 
     hud_push_crosshair(&vl, win_w, win_h, 1.0f, 1.0f, 1.0f);
 
-    /* bottom-left: health, e.g. "100/100" */
+    /* bottom-left: "HP" label above the health ratio, e.g. "100/100" */
+    text_push_string(out_text, "HP", 24.0f, (f32)win_h - 56.0f - label_h - 4.0f,
+                     label_w, label_h, win_w, win_h, 0.6f, 0.9f, 0.6f);
     push_stat_ratio(&vl, (int)health, PLAYER_MAX_HEALTH, 24.0f, (f32)win_h - 56.0f,
                     digit_w, digit_h, win_w, win_h, 0.2f, 0.9f, 0.2f);
 
-    /* bottom-right: ammo, e.g. "60/60" -- right-aligned using the
-     * computed width so the right edge stays fixed regardless of how
-     * many digits the current value has (measured with a throwaway
-     * VertexList first, since we need the width before knowing where
-     * to actually start drawing). */
+    /* bottom-right: "AMMO" label above the ammo ratio, e.g. "60/60" --
+     * both right-aligned using their own measured width so the right
+     * edge stays fixed regardless of digit/label count. */
     {
         VertexList measure;
         memset(&measure, 0, sizeof(measure));
@@ -1059,16 +1157,41 @@ static VertexList build_hud_geometry(int win_w, int win_h)
                                      digit_w, digit_h, win_w, win_h, 0, 0, 0);
         vertex_list_free(&measure);
     }
+    ammo_label_w = text_string_width("AMMO", label_w);
+    text_push_string(out_text, "AMMO", (f32)win_w - 24.0f - ammo_label_w,
+                     (f32)win_h - 56.0f - label_h - 4.0f,
+                     label_w, label_h, win_w, win_h, 0.95f, 0.8f, 0.4f);
     push_stat_ratio(&vl, (int)ammo, PLAYER_MAX_AMMO,
                     (f32)win_w - 24.0f - ammo_width, (f32)win_h - 56.0f,
                     digit_w, digit_h, win_w, win_h, 0.9f, 0.7f, 0.15f);
 
-    /* top-right: wave */
-    hud_push_number(&vl, (int)wave, (f32)win_w - 140.0f, 24.0f, 20.0f, 32.0f,
+    /* top-right: "WAVE" label, wave number below it */
+    text_push_string(out_text, "WAVE", (f32)win_w - 140.0f, 24.0f,
+                     label_w, label_h, win_w, win_h, 0.8f, 0.8f, 0.9f);
+    hud_push_number(&vl, (int)wave, (f32)win_w - 140.0f, 24.0f + label_h + 4.0f, 20.0f, 32.0f,
                     win_w, win_h, 0.8f, 0.8f, 0.9f);
-    /* top-left: zombies remaining */
-    hud_push_number(&vl, zombie_count, 24.0f, 24.0f, 20.0f, 32.0f,
+    /* top-left: "ZOMBIES" label, count below it */
+    text_push_string(out_text, "ZOMBIES", 24.0f, 24.0f,
+                     label_w, label_h, win_w, win_h, 0.95f, 0.5f, 0.5f);
+    hud_push_number(&vl, zombie_count, 24.0f, 24.0f + label_h + 4.0f, 20.0f, 32.0f,
                     win_w, win_h, 0.9f, 0.3f, 0.3f);
+
+    /* Hit feed, top-right below the WAVE block, right-aligned, newest
+     * at the bottom -- matches HUD.gd's HUD element for element (see
+     * push_feed_entry() and get_feed_snapshot()'s comments). */
+    {
+        const f32 feed_char_w = 12.0f, feed_char_h = 16.0f, feed_line_h = 22.0f;
+        f32 feed_top = 24.0f + label_h + 4.0f + 32.0f + 16.0f;   /* below WAVE's number */
+
+        feed_n = get_feed_snapshot(feed, dt);
+        for (i = 0; i < feed_n; i++) {
+            f32 w = text_string_width(feed[i].text, feed_char_w);
+            text_push_string(out_text, feed[i].text, (f32)win_w - 24.0f - w,
+                             feed_top + (f32)i * feed_line_h,
+                             feed_char_w, feed_char_h, win_w, win_h,
+                             feed[i].r, feed[i].g, feed[i].b);
+        }
+    }
 
     return vl;
 }
@@ -1499,7 +1622,8 @@ int main(int argc, char **argv)
                 Mat4 identity = mat4_identity();
 
                 VertexList entity_geo = build_entity_geometry();
-                VertexList hud_geo    = build_hud_geometry(win_w, win_h);
+                TextVertexList hud_text;
+                VertexList hud_geo    = build_hud_geometry(win_w, win_h, dt, &hud_text);
 
                 glViewport(0, 0, win_w, win_h);
                 glClearColor(0.02f, 0.02f, 0.03f, 1.0f);
@@ -1541,6 +1665,14 @@ int main(int argc, char **argv)
                     draw_vertex_list(hud_vbo, pos_loc, color_loc, hud_geo.count);
                 }
                 vertex_list_free(&hud_geo);
+
+                /* HUD text: labels (HP/AMMO/WAVE/ZOMBIES) + hit feed --
+                 * same text program the menu uses. */
+                glUseProgram(text_prog);
+                draw_text(text_vbo, font_texture, text_pos_loc, text_texcoord_loc,
+                         text_color_loc, text_tex_loc, &hud_text);
+                text_vlist_free(&hud_text);
+
                 glEnable(GL_DEPTH_TEST);   /* restore for next frame's 3D pass */
             }
 
