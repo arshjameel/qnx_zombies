@@ -125,10 +125,21 @@
  * these before the "Menu" section further down. */
 #define APP_STATE_MENU    0
 #define APP_STATE_PLAYING 1
+#define APP_STATE_WON     2
 #define MENU_OPTION_SOLO   0
 #define MENU_OPTION_COOP   1
 #define MENU_OPTION_QUIT   2
 #define MENU_OPTION_COUNT  3
+#define WON_OPTION_REPLAY 0
+#define WON_OPTION_QUIT   1
+#define WON_OPTION_COUNT  2
+/* COUPLING: must match server.c's WAVE_COUNT -- how many waves exist
+ * before the game is "won". The server never sends an explicit "you
+ * won" flag; the client infers it from wave == WAVE_COUNT with zero
+ * zombies left, which only becomes true once the boss (spawned as
+ * part of wave WAVE_COUNT) is actually dead, and stays true forever
+ * after since spawn_wave() is a no-op past WAVE_COUNT. */
+#define WAVE_COUNT 4
 /* Floor/platform height transitions (NOT ramps -- those are fully
  * continuous now, see level_continuous_ramp_height(), and need no
  * easing at all). These only apply to the flat-to-flat step case,
@@ -163,6 +174,8 @@
                                * max reachable jump apex (v^2/2g =~ 1.03
                                * with the constants above) so jumping near
                                * a platform edge can't falsely trigger it. */
+#define DAMAGE_FLASH_DECAY_TIME 0.5f   /* seconds for g_damage_flash to fade
+                                        * from 1.0 (just hit) back to 0 */
 
 /* ------------------------------------------------------------------ */
 /* Shared scalar state -- plain volatile, matching the rest of this    */
@@ -212,6 +225,28 @@ static volatile int g_menu_confirm_requested  = 0;
 static volatile int g_connect_mode = CONNECT_MODE_COOP;   /* set by the menu
                                                             * before the net
                                                             * thread starts */
+static volatile int g_reset_requested = 0;   /* set by the render thread when
+                                              * REPLAY is chosen on the win
+                                              * popup; only the net thread
+                                              * does socket I/O, so it's the
+                                              * one that actually sends
+                                              * PKT_RESET_SESSION, same
+                                              * cross-thread-flag pattern as
+                                              * g_jump_requested etc. */
+static volatile f32 g_damage_flash = 0.0f;   /* 0 = no flash, 1 = just got hit.
+                                              * Set to 1.0 by the net thread
+                                              * when a PKT_HIT arrives where
+                                              * I'm the victim and a zombie is
+                                              * the attacker; decayed toward 0
+                                              * by the render thread each frame
+                                              * (see DAMAGE_FLASH_DECAY). No
+                                              * lock needed -- a single f32,
+                                              * written by one thread and read/
+                                              * decayed by the other, where a
+                                              * stale read for one frame is
+                                              * completely harmless (unlike
+                                              * g_state's multi-field snapshots,
+                                              * which need real consistency). */
 static volatile int g_mouse_left_down = 0;
 static volatile f32 g_cam_yaw = 0.0f, g_cam_pitch = 0.0f;
 
@@ -398,6 +433,17 @@ static void *net_thread_main(void *arg)
         sendto(g_sock, &inp, sizeof(inp), 0,
                (struct sockaddr *)&g_server_addr, sizeof(g_server_addr));
 
+        if (g_reset_requested) {
+            PktHeader reset_hdr;
+            g_reset_requested = 0;
+            memset(&reset_hdr, 0, sizeof(reset_hdr));
+            reset_hdr.type      = PKT_RESET_SESSION;
+            reset_hdr.player_id = g_my_id;
+            reset_hdr.tick      = local_tick++;
+            sendto(g_sock, &reset_hdr, sizeof(reset_hdr), 0,
+                  (struct sockaddr *)&g_server_addr, sizeof(g_server_addr));
+        }
+
         while ((n = recvfrom(g_sock, buf, sizeof(buf), 0, NULL, NULL)) > 0) {
             if (n < (ssize_t)sizeof(PktHeader)) continue;
             PktHeader *hdr = (PktHeader *)buf;
@@ -487,6 +533,7 @@ static void *net_thread_main(void *arg)
                     if (hit->attacker_id == ATTACKER_ZOMBIE) {
                         snprintf(msg, sizeof(msg), "ZOMBIE MAULED PLAYER %d", hit->victim_id);
                         r = 0.9f; g = 0.2f; b = 0.2f;     /* red */
+                        if (hit->victim_id == g_my_id) g_damage_flash = 1.0f;
                     } else {
                         snprintf(msg, sizeof(msg), "PLAYER %d HIT PLAYER %d",
                                 hit->attacker_id, hit->victim_id);
@@ -499,6 +546,30 @@ static void *net_thread_main(void *arg)
         portable_sleep_ms(50);
     }
     return NULL;
+}
+
+/* Stops the network thread (if running) and clears the shared game
+ * state, then switches back to the menu -- shared by ESC-while-
+ * playing and "QUIT TO MENU" from the win popup, which need the
+ * exact same teardown. *net_thread_started is updated in place. */
+static void teardown_and_return_to_menu(pthread_t net_tid, int *net_thread_started)
+{
+    g_net_thread_running = 0;
+    if (*net_thread_started) {
+        pthread_join(net_tid, NULL);
+        *net_thread_started = 0;
+    }
+
+    pthread_mutex_lock(&g_state.lock);
+    g_state.player_count = 0;
+    g_state.zombie_count = 0;
+    g_state.pickup_count = 0;
+    g_state.has_my_state = 0;
+    g_state.feed_count   = 0;
+    pthread_mutex_unlock(&g_state.lock);
+
+    g_app_state = APP_STATE_MENU;
+    printf("[main] Returning to menu.\n");
 }
 
 static int start_net_thread_with_scheduling(pthread_t *out_tid)
@@ -681,6 +752,39 @@ static const char *TEXT_FRAGMENT_SHADER_SRC =
     "    float a = texture2D(u_tex, v_texcoord).a;\n"
     "    if (a < 0.5) discard;\n"
     "    gl_FragColor = vec4(v_color, 1.0);\n"
+    "}\n";
+
+/* Fourth program, the damage vignette -- the one place in this
+ * renderer that actually needs GL_BLEND (everything else uses either
+ * opaque flat/textured fills or a hard discard cutout specifically to
+ * avoid it). A single full-screen quad (built once, see
+ * g_vignette_vbo in main()) with a fragment shader that reddens
+ * toward the screen edges, modulated by u_intensity -- 0 most of the
+ * time (nothing drawn, effectively invisible even with blending on,
+ * see the alpha computation below), ramped to 1.0 the instant a
+ * zombie hit lands on me and decayed back to 0 over
+ * DAMAGE_FLASH_DECAY_TIME seconds by the render thread each frame. */
+static const char *VIGNETTE_VERTEX_SHADER_SRC =
+    "attribute vec2 a_position;\n"
+    "varying vec2 v_ndc;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "    v_ndc = a_position;\n"
+    "}\n";
+
+static const char *VIGNETTE_FRAGMENT_SHADER_SRC =
+    "precision mediump float;\n"
+    "uniform float u_intensity;\n"
+    "varying vec2 v_ndc;\n"
+    "void main() {\n"
+    "    float dist = length(v_ndc);\n"
+    /* smoothstep(0.3, 1.1, dist): ~0 near screen center, ramping to 1
+     * toward the corners (NDC corners are at distance sqrt(2) =~
+     * 1.414, so 1.1 keeps even the very edges from reaching pure
+     * flat-color red, preserving a "halo" rather than a solid wash) */
+    "    float vignette = smoothstep(0.3, 1.1, dist);\n"
+    "    float alpha = vignette * u_intensity * 0.65;\n"
+    "    gl_FragColor = vec4(0.8, 0.05, 0.05, alpha);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src)
@@ -1267,6 +1371,68 @@ static VertexList build_menu_geometry(int win_w, int win_h, int selection, TextV
     return vl;
 }
 
+/* Win popup after beating wave 4's boss -- same visual language as
+ * build_menu_geometry() (numbered color-coded boxes, dim-unless-
+ * selected) for a consistent feel, just two options instead of three
+ * and no separate title-vs-options spacing logic needed since there's
+ * only ever one screen's worth of content here. */
+static VertexList build_won_geometry(int win_w, int win_h, int selection, TextVertexList *out_text)
+{
+    VertexList vl;
+    const f32 box_w = 340.0f, box_h = 70.0f, spacing = 100.0f;
+    const f32 base_colors[WON_OPTION_COUNT][3] = {
+        { 0.25f, 0.70f, 0.30f },   /* 1: Replay -- green */
+        { 0.55f, 0.30f, 0.65f },   /* 2: Quit to menu -- purple, deliberately
+                                    * distinct from the main menu's own red
+                                    * Quit box so the two don't read as "the
+                                    * same action" at a glance */
+    };
+    static const char *labels[WON_OPTION_COUNT] = { "REPLAY", "QUIT TO MENU" };
+    f32 first_top = (f32)win_h * 0.42f;
+    f32 cx = (f32)win_w * 0.5f;
+    int i;
+
+    memset(&vl, 0, sizeof(vl));
+    memset(out_text, 0, sizeof(*out_text));
+
+    {
+        const char *title = "VICTORY";
+        f32 title_char_w = 32.0f, title_char_h = 46.0f;
+        f32 title_w = text_string_width(title, title_char_w);
+        text_push_string(out_text, title, cx - title_w * 0.5f, first_top - 110.0f,
+                         title_char_w, title_char_h, win_w, win_h, 0.95f, 0.85f, 0.3f);
+    }
+    {
+        const char *sub = "ALL 4 WAVES CLEARED";
+        f32 sub_char_w = 14.0f, sub_char_h = 18.0f;
+        f32 sub_w = text_string_width(sub, sub_char_w);
+        text_push_string(out_text, sub, cx - sub_w * 0.5f, first_top - 50.0f,
+                         sub_char_w, sub_char_h, win_w, win_h, 0.8f, 0.8f, 0.85f);
+    }
+
+    for (i = 0; i < WON_OPTION_COUNT; i++) {
+        f32 top    = first_top + (f32)i * spacing;
+        f32 bottom = top + box_h;
+        f32 left   = cx - box_w * 0.5f;
+        f32 right  = cx + box_w * 0.5f;
+        f32 dim    = (i == selection) ? 1.0f : 0.45f;
+        f32 r = base_colors[i][0] * dim;
+        f32 g = base_colors[i][1] * dim;
+        f32 b = base_colors[i][2] * dim;
+        f32 label_char_w = 22.0f, label_char_h = 30.0f;
+        f32 label_w = text_string_width(labels[i], label_char_w);
+
+        hud_push_quad(&vl, left, top, right, bottom, win_w, win_h, r, g, b);
+        hud_push_digit(&vl, i + 1, left + 24.0f, top + (box_h - 40.0f) * 0.5f,
+                       24.0f, 40.0f, win_w, win_h, 1.0f, 1.0f, 1.0f);
+        text_push_string(out_text, labels[i], cx + 20.0f - label_w * 0.5f,
+                         top + (box_h - label_char_h) * 0.5f,
+                         label_char_w, label_char_h, win_w, win_h, 1.0f, 1.0f, 1.0f);
+    }
+
+    return vl;
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                                 */
 /* ------------------------------------------------------------------ */
@@ -1287,11 +1453,12 @@ int main(int argc, char **argv)
 
     pthread_t net_tid;
 
-    GLuint  prog, level_prog, text_prog;
+    GLuint  prog, level_prog, text_prog, vignette_prog;
     GLint   pos_loc, color_loc, mvp_loc;
     GLint   level_pos_loc, level_normal_loc, level_color_loc, level_mvp_loc;
     GLint   text_pos_loc, text_texcoord_loc, text_color_loc, text_tex_loc;
-    GLuint  level_vbo, entity_vbo, hud_vbo, text_vbo;
+    GLint   vignette_pos_loc, vignette_intensity_loc;
+    GLuint  level_vbo, entity_vbo, hud_vbo, text_vbo, vignette_vbo;
     GLuint  font_texture;
     int     level_vertex_count;
     VertexList level_geo;
@@ -1449,6 +1616,33 @@ int main(int argc, char **argv)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenBuffers(1, &text_vbo);
 
+    /* Fourth program, the damage vignette -- see the comment above
+     * VIGNETTE_FRAGMENT_SHADER_SRC for why this is the one place that
+     * needs GL_BLEND. mvp_loc unused here too, same reason as
+     * text_prog above (this vertex shader has no u_mvp either). */
+    {
+        GLint unused_mvp_loc;
+        vignette_prog = build_shader_program(VIGNETTE_VERTEX_SHADER_SRC, VIGNETTE_FRAGMENT_SHADER_SRC,
+                                             &unused_mvp_loc);
+    }
+    if (!vignette_prog) { fprintf(stderr, "Vignette shader setup failed\n"); return 1; }
+    vignette_pos_loc       = glGetAttribLocation(vignette_prog, "a_position");
+    vignette_intensity_loc = glGetUniformLocation(vignette_prog, "u_intensity");
+
+    /* Static full-screen quad (-1,-1) to (1,1) in NDC -- built once,
+     * unlike level_vbo. Never actually changes shape, only the
+     * u_intensity uniform does, so there's no reason to rebuild this
+     * VBO every frame the way the dynamic entity/HUD/text lists are. */
+    {
+        f32 fullscreen_quad[12] = {
+            -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, 1.0f,
+            -1.0f, -1.0f,  1.0f,  1.0f, -1.0f, 1.0f,
+        };
+        glGenBuffers(1, &vignette_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vignette_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(fullscreen_quad), fullscreen_quad, GL_STATIC_DRAW);
+    }
+
     level_geo = build_level_geometry();
     level_vertex_count = level_geo.count;
     glGenBuffers(1, &level_vbo);
@@ -1470,6 +1664,7 @@ int main(int argc, char **argv)
      * start until Play Solo/Coop is confirmed there ---- */
     {
         int menu_selection  = MENU_OPTION_SOLO;
+        int won_selection   = WON_OPTION_REPLAY;
         int net_thread_started = 0;
 
         /* Camera starting position -- only meaningful once gameplay
@@ -1586,29 +1781,101 @@ int main(int argc, char **argv)
                 continue;   /* skip the gameplay branch below this frame */
             }
 
+            if (g_app_state == APP_STATE_WON) {
+                if (g_menu_nav_up_requested) {
+                    g_menu_nav_up_requested = 0;
+                    won_selection = (won_selection + WON_OPTION_COUNT - 1) % WON_OPTION_COUNT;
+                }
+                if (g_menu_nav_down_requested) {
+                    g_menu_nav_down_requested = 0;
+                    won_selection = (won_selection + 1) % WON_OPTION_COUNT;
+                }
+                if (g_menu_confirm_requested) {
+                    g_menu_confirm_requested = 0;
+                    if (won_selection == WON_OPTION_REPLAY) {
+                        /* Stay connected -- just ask the server to reset
+                         * this session, then resume gameplay. The next
+                         * PktState (wave 1, fresh zombies, full health)
+                         * arrives within one server tick. */
+                        g_reset_requested = 1;
+                        g_app_state = APP_STATE_PLAYING;
+                        printf("[main] Replay requested.\n");
+                    } else {
+                        teardown_and_return_to_menu(net_tid, &net_thread_started);
+                    }
+                    won_selection = WON_OPTION_REPLAY;   /* reset the popup's own
+                                                          * cursor for next time,
+                                                          * independent of which
+                                                          * option was just picked */
+                    continue;
+                }
+
+                if (g_running) {
+                    TextVertexList won_text;
+                    VertexList won_geo = build_won_geometry(win_w, win_h, won_selection, &won_text);
+                    Mat4 identity = mat4_identity();
+
+                    glViewport(0, 0, win_w, win_h);
+                    glClearColor(0.04f, 0.06f, 0.05f, 1.0f);   /* dark green-tinted,
+                                                                * distinct from the
+                                                                * main menu's neutral
+                                                                * dark background */
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                    glUseProgram(prog);
+                    glDisable(GL_DEPTH_TEST);
+                    glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, identity.m);
+                    if (won_geo.count > 0) {
+                        glBindBuffer(GL_ARRAY_BUFFER, hud_vbo);
+                        glBufferData(GL_ARRAY_BUFFER,
+                                    (GLsizeiptr)(sizeof(GeoVertex) * (size_t)won_geo.count),
+                                    won_geo.verts, GL_DYNAMIC_DRAW);
+                        draw_vertex_list(hud_vbo, pos_loc, color_loc, won_geo.count);
+                    }
+                    vertex_list_free(&won_geo);
+
+                    glUseProgram(text_prog);
+                    draw_text(text_vbo, font_texture, text_pos_loc, text_texcoord_loc,
+                             text_color_loc, text_tex_loc, &won_text);
+                    text_vlist_free(&won_text);
+
+                    glEnable(GL_DEPTH_TEST);
+
+                    eglSwapBuffers(egl_disp, egl_surf);
+                }
+                continue;
+            }
+
             /* ---- APP_STATE_PLAYING ---- */
             if (g_return_to_menu_requested) {
                 g_return_to_menu_requested = 0;
+                teardown_and_return_to_menu(net_tid, &net_thread_started);
+                continue;   /* menu renders itself next iteration */
+            }
 
-                g_net_thread_running = 0;
-                if (net_thread_started) {
-                    pthread_join(net_tid, NULL);
-                    net_thread_started = 0;
-                }
-
-                /* Clear the shared snapshot so a stale zombie/player
-                 * from the last session doesn't flash on screen for a
-                 * frame before the next PktState arrives. */
+            /* Win check: wave has reached WAVE_COUNT and every zombie
+             * from that final wave (the boss) is dead -- true forever
+             * once it first becomes true, since spawn_wave() never
+             * spawns a wave 5. has_my_state isn't strictly required
+             * for correctness here (the zero-initialized defaults
+             * read wave=0, which never satisfies ">= WAVE_COUNT" on
+             * their own), but checking it keeps this consistent with
+             * the same guard used elsewhere (e.g. reconcile_camera())
+             * for "don't act on state before any has really arrived". */
+            {
+                u8  wave_snapshot;
+                int zombie_count_snapshot, has_state_snapshot;
                 pthread_mutex_lock(&g_state.lock);
-                g_state.player_count = 0;
-                g_state.zombie_count = 0;
-                g_state.pickup_count = 0;
-                g_state.has_my_state = 0;
+                wave_snapshot           = g_state.wave;
+                zombie_count_snapshot   = g_state.zombie_count;
+                has_state_snapshot      = g_state.has_my_state;
                 pthread_mutex_unlock(&g_state.lock);
 
-                g_app_state = APP_STATE_MENU;
-                printf("[main] Returning to menu.\n");
-                continue;   /* menu renders itself next iteration */
+                if (has_state_snapshot && wave_snapshot >= WAVE_COUNT && zombie_count_snapshot == 0) {
+                    g_app_state = APP_STATE_WON;
+                    printf("[main] Wave %d cleared -- victory.\n", WAVE_COUNT);
+                    continue;
+                }
             }
 
             update_camera(&cam, dt);
@@ -1672,6 +1939,28 @@ int main(int argc, char **argv)
                 draw_text(text_vbo, font_texture, text_pos_loc, text_texcoord_loc,
                          text_color_loc, text_tex_loc, &hud_text);
                 text_vlist_free(&hud_text);
+
+                /* Damage vignette, drawn last so it overlays everything
+                 * including the HUD -- matches how a screen-edge damage
+                 * flash reads in most FPSes (on top of, not behind, the
+                 * UI). g_damage_flash decays linearly over
+                 * DAMAGE_FLASH_DECAY_TIME seconds; skip the draw entirely
+                 * once it reaches 0 rather than drawing an
+                 * always-fully-transparent quad every frame forever. */
+                g_damage_flash -= dt / DAMAGE_FLASH_DECAY_TIME;
+                if (g_damage_flash < 0.0f) g_damage_flash = 0.0f;
+                if (g_damage_flash > 0.0f) {
+                    glUseProgram(vignette_prog);
+                    glUniform1f(vignette_intensity_loc, g_damage_flash);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glBindBuffer(GL_ARRAY_BUFFER, vignette_vbo);
+                    glVertexAttribPointer((GLuint)vignette_pos_loc, 2, GL_FLOAT, GL_FALSE, 0, (const void *)0);
+                    glEnableVertexAttribArray((GLuint)vignette_pos_loc);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    glDisable(GL_BLEND);   /* nothing else in this renderer
+                                           * expects blend left enabled */
+                }
 
                 glEnable(GL_DEPTH_TEST);   /* restore for next frame's 3D pass */
             }

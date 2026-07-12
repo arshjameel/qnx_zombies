@@ -597,6 +597,48 @@ static void broadcast_hit(u8 session_id, u8 victim_id, u8 victim_type, u8 attack
             send_to(i, &pkt, sizeof(pkt));
 }
 
+/* Full reset of a session for "replay" after beating wave 4 -- wave
+ * counter, every zombie belonging to the session, every pickup's
+ * cooldown, and every currently-connected player's health/ammo/
+ * position in that session (in coop, one player choosing replay
+ * restarts it for the whole team, matching a shared-world session's
+ * "we all just beat it together" framing). Ends by calling
+ * spawn_wave() directly rather than relying on the per-tick "zombie
+ * count reached zero" check to notice -- immediate feels right for
+ * an explicit player action, and mirrors how PKT_CONNECT already
+ * kicks off wave 1 immediately rather than waiting a tick. */
+static void reset_session(u8 sid)
+{
+    int i;
+
+    g_wave[sid] = 0;
+
+    for (i = 0; i < MAX_ZOMBIES; i++) {
+        if (g_zombies[i].active && g_zombies[i].session_id == sid)
+            g_zombies[i].active = 0;
+    }
+
+    for (i = 0; i < g_pickup_spawn_count; i++) {
+        g_pickups[sid][i].active        = 1;
+        g_pickups[sid][i].respawn_timer = 0;
+    }
+
+    for (i = 0; i < NET_MAX_PLAYERS; i++) {
+        if (!g_players[i].active || g_players[i].session_id != sid) continue;
+        g_players[i].x              = SPAWN_X[i % SPAWN_COUNT];
+        g_players[i].y              = SPAWN_Y[i % SPAWN_COUNT];
+        g_players[i].angle          = SPAWN_A[i % SPAWN_COUNT];
+        g_players[i].inp_look_angle = g_players[i].angle;
+        g_players[i].health         = 100;
+        g_players[i].ammo           = AMMO_MAX;
+        g_players[i].alive          = 1;
+        g_players[i].respawn_timer  = 0;
+    }
+
+    spawn_wave(sid);
+    printf("Session %d: reset for replay\n", sid);
+}
+
 /* ------------------------------------------------------------------ */
 /* Receive loop                                                         */
 /* ------------------------------------------------------------------ */
@@ -662,6 +704,12 @@ static void recv_packets(void)
                 printf("Player %d disconnected\n", id);
                 g_players[id].active = 0;
             }
+            break;
+        }
+
+        case PKT_RESET_SESSION: {
+            int id = find_player(&from);
+            if (id >= 0) reset_session(g_players[id].session_id);
             break;
         }
 

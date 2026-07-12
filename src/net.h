@@ -28,6 +28,12 @@
 #define PKT_STATE       0x04u  /* server -> client: full game state    */
 #define PKT_HIT         0x06u  /* server -> client: hit notification   */
 #define PKT_DISCONNECT  0x07u  /* either direction                     */
+#define PKT_RESET_SESSION 0x08u  /* client -> server: replay after beating
+                                   * wave 4 -- see server.c's handler for
+                                   * exactly what gets reset. No extra
+                                   * fields beyond the header; the sender's
+                                   * session is found the same way
+                                   * PKT_INPUT/PKT_DISCONNECT already do. */
 
 /* ------------------------------------------------------------------ */
 /* Entity types (used in PktHit to disambiguate victim_id)             */

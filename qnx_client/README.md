@@ -8,7 +8,104 @@ This client is a third, independent way to play: QNX becomes the
 renderer as well as the server, using QNX's own native APIs instead
 of Godot.
 
-## Status: HUD labels + hit feed
+## Status: Win popup (replay/quit) + damage vignette
+
+**Win popup.** Beating wave 4's boss now shows a "VICTORY" screen with
+two options -- REPLAY and QUIT TO MENU -- navigated the same way as
+the main menu (Up/Down, E to confirm), same visual language (numbered,
+color-coded boxes, dim-unless-selected).
+
+**This needed a real server-side gap closed first: there was no way
+to actually replay.** A session's wave counter just capped at 4
+forever -- nothing ever set it back to 0, and in coop specifically the
+session id is always shared (`SESSION_COOP`), so even fully
+disconnecting and reconnecting couldn't produce a fresh session the
+way solo's per-slot session ids theoretically could. Added a new
+packet, `PKT_RESET_SESSION` (client to server, header only -- the
+session is found the same way `PKT_INPUT`/`PKT_DISCONNECT` already
+resolve the sender), and a `reset_session()` handler that resets the
+wave counter, clears every zombie belonging to that session, resets
+every pickup's cooldown, and restores every currently-connected
+player in the session to full health/ammo/spawn position -- then
+calls `spawn_wave()` directly so wave 1 starts immediately rather
+than waiting a tick for the normal wave-clear check to notice. In
+coop, one player choosing REPLAY restarts it for the whole team.
+
+**Win detection is entirely client-side inference, not a server
+flag:** `wave >= WAVE_COUNT && zombie_count == 0`, which the server
+never explicitly announces, but which becomes true exactly once (right
+after the boss dies) and then stays true forever (no wave 5 ever
+spawns) -- a safe, one-way signal to check for every frame.
+
+**REPLAY sends the reset packet without disconnecting** -- stays on
+the same connection, server resets the shared session, next
+`PktState` (arriving within one tick) already has wave 1's fresh
+zombies and full health. QUIT TO MENU reuses the exact same teardown
+already built for ESC-while-playing (factored out into
+`teardown_and_return_to_menu()` now that two call sites need it).
+
+**Damage vignette.** Getting hit by a zombie now reddens the screen
+edges briefly and fades -- a proper vignette (concentrated at the
+edges, clear in the center), not a flat screen-tint. This is the one
+place in this renderer that actually needed `GL_BLEND`; everything
+else uses opaque fills or the text shader's hard alpha cutout
+specifically to avoid needing it. Scoped tightly: enabled immediately
+before the vignette's single draw call, disabled immediately after,
+so nothing else in the renderer has to account for blend state being
+left on.
+
+- Triggered by the same `PKT_HIT` parsing the hit feed already added
+  -- when the victim is me specifically and the attacker is a zombie,
+  a flash timer jumps to 1.0.
+- Decays linearly to 0 over `DAMAGE_FLASH_DECAY_TIME` (0.5s), read and
+  decayed by the render thread each frame; skipped entirely (no draw
+  call at all) once it reaches 0, rather than drawing an
+  always-invisible full-screen quad forever.
+- A single static full-screen quad, built once at startup like
+  `level_vbo` -- only the shader's `u_intensity` uniform changes frame
+  to frame, not the geometry.
+
+**Verified, not just "it compiled":**
+- `reset_session()` tested in isolation via the same `#include
+  "server.c"` trick used for the wave-table logic earlier: simulated a
+  full 4-wave playthrough, damaged the player, spent ammo, moved
+  position, ate a pickup, called `reset_session()`, and confirmed
+  every single field came back correct (health 100, ammo 60, spawn
+  position, pickup active again, wave back to 1, fresh 3-zombie wave
+  1). Caught and fixed a bug in the *test* along the way (forgot to
+  call `init_pickups()`, so the pickup-reset loop had nothing to
+  iterate) -- a good reminder that test setup needs the same scrutiny
+  as the code under test.
+- `PKT_RESET_SESSION` also tested over a **real UDP round-trip**
+  against the real running server (not just the isolated function
+  call), confirming the packet dispatches correctly end to end.
+- Both new shader programs (vignette + a re-check of every other
+  shader in the file) validated through the real GLSL compiler after
+  catching a genuine bug in my own *extraction* script: a comment
+  containing the English word "halo" in quotes was being
+  misinterpreted as shader source text by a regex that didn't account
+  for C comments. Fixed the extraction (strip comments before
+  matching string literals) and re-validated everything, not just the
+  new shaders, to make sure nothing upstream had been affected the
+  same way.
+- Ran the actual compiled binary against the actual server for a
+  sustained 6-second run with all the new per-frame code active (win
+  check, vignette decay) -- zero crashes.
+
+### Files changed this round
+
+- `src/net.h` -- `PKT_RESET_SESSION`.
+- `src/server.c` -- `reset_session()`; dispatch case for
+  `PKT_RESET_SESSION`.
+- `src/main.c` -- `APP_STATE_WON`, `WON_OPTION_*`, client-side
+  `WAVE_COUNT` (coupling comment); `build_won_geometry()`;
+  `teardown_and_return_to_menu()` (factored out, now shared by two
+  call sites); `g_reset_requested` (render thread to net thread) and
+  the net thread's `PKT_RESET_SESSION` send; `g_damage_flash` (net
+  thread to render thread) and its trigger in the `PKT_HIT` handler;
+  `VIGNETTE_VERTEX_SHADER_SRC`/`VIGNETTE_FRAGMENT_SHADER_SRC`, the
+  vignette program, its static full-screen quad VBO, and the decay +
+  draw logic in the gameplay render loop.
 
 The HUD now has real text captions ("HP", "AMMO", "WAVE", "ZOMBIES")
 above each numeric readout instead of bare numbers, and a live hit
