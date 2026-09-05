@@ -1,17 +1,3 @@
-# qnx_client -- native QNX Screen/EGL/GLES2 client.
-#
-# QNX-ONLY. This does not compile on Linux (no libscreen/libEGL/
-# libGLESv2 there)
-#
-# Reuses ../src/net.c, ../src/map.c, ../src/net.h, ../src/map.h
-# via -I and by compiling them into this binary.
-#
-# Targets:
-#   make                       Stage 1 spike (window/input/net proof)
-#   make deploy                cross-compile + scp to the Pi
-#   make run                   deploy + run over ssh
-#   make clean / rebuild
-
 BUILD_PROFILE ?= debug
 TOP_SRC := ../src
 BUILD_DIR := build/$(BUILD_PROFILE)
@@ -66,7 +52,7 @@ $(BUILD_DIR)/map.o: $(TOP_SRC)/map.c
 	@mkdir -p $(dir $@)
 	$(QCC) $(CFLAGS) -c $< -o $@
 
-# ---- Pi deployment ----
+# pi deployment
 PI_USER := qnxuser
 PI_HOST := qnxpi
 PI_DIR  := /data/home/qnxuser/game

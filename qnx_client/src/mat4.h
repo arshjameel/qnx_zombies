@@ -1,18 +1,8 @@
 #ifndef MAT4_H
 #define MAT4_H
 
-/*
- * mat4.h -- minimal column-major 4x4 matrix math for GLES2.
- *
- * GLES2 has no fixed-function matrix stack (glRotate/glTranslate are
- * GLES1-only) -- MVP has to be computed by hand and uploaded via a
- * shader uniform. Standard, well-known formulas; header-only so it
- * can be used from both main.c and level_geo.c without a separate
- * translation unit.
- */
-
 #include <math.h>
-#include "common.h"   /* f32 */
+#include "common.h"   
 
 typedef struct { f32 m[16]; } Mat4;
 
@@ -25,7 +15,6 @@ static Mat4 mat4_identity(void)
     return r;
 }
 
-/* a * b -- transforms by b first, then a (standard column-vector convention) */
 static Mat4 mat4_multiply(Mat4 a, Mat4 b)
 {
     Mat4 r;
@@ -89,10 +78,6 @@ static Mat4 mat4_perspective(f32 fovy_rad, f32 aspect, f32 znear, f32 zfar)
     return r;
 }
 
-/* View matrix for a camera at (eye_x,eye_y,eye_z) with yaw (around Y)
- * and pitch (around X): the view matrix is the inverse of the
- * camera's own world transform Translate(eye) * RotateY(yaw) *
- * RotateX(pitch), i.e. RotateX(-pitch) * RotateY(-yaw) * Translate(-eye). */
 static Mat4 mat4_view_from_yaw_pitch(f32 eye_x, f32 eye_y, f32 eye_z, f32 yaw, f32 pitch)
 {
     Mat4 t  = mat4_translate(-eye_x, -eye_y, -eye_z);
@@ -106,8 +91,6 @@ static void mat4_transform_point(Mat4 m, f32 x, f32 y, f32 z, f32 *ox, f32 *oy, 
     *ox = m.m[0] * x + m.m[4] * y + m.m[8]  * z + m.m[12];
     *oy = m.m[1] * x + m.m[5] * y + m.m[9]  * z + m.m[13];
     *oz = m.m[2] * x + m.m[6] * y + m.m[10] * z + m.m[14];
-    /* w is always 1 for the affine transforms used here, so it's not
-     * computed/returned. */
 }
 
-#endif /* MAT4_H */
+#endif 

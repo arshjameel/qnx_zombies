@@ -1,18 +1,3 @@
-/*
- * font_atlas.h -- Public Pixel font (GGBotNet, CC0 1.0 Universal,
- * https://github.com/ggbotnet/fonts-cc0), rasterized to a single-
- * channel (alpha-only) bitmap atlas at build time. Regenerate with
- * tools/make_font_atlas.py -- this header IS the asset, same pattern
- * as QNX's gles2-maze sample embedding brick_wall.tga as brick_wall.h
- * via xxd -i, just single-channel and pre-decoded instead of a raw
- * TGA file (so no runtime image-format parser is needed at all).
- *
- * Layout: 16 columns, 16x16 px per cell, monospaced
- * (every glyph has an identical 16px advance width in the source
- * font). Glyph for ASCII code C is at cell index
- * (C - FONT_ATLAS_FIRST_CHAR).
- */
-
 #ifndef FONT_ATLAS_H
 #define FONT_ATLAS_H
 
@@ -1255,4 +1240,4 @@ static const unsigned char font_atlas_pixels[24576] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 };
 
-#endif /* FONT_ATLAS_H */
+#endif

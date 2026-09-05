@@ -1,17 +1,3 @@
-# qnx-coop-game -- server-only Makefile
-#
-# Targets:
-#   make server              Linux headless server (local testing)
-#   make qnx-server          QNX AArch64 server (cross-compile)
-#   make deploy-server       cross-compile + scp to Pi
-#   make run-server          deploy + start server over ssh
-#   make clean
-#   make rebuild
-#
-# Build profiles:
-#   make server BUILD_PROFILE=release   -O2 -DNDEBUG
-#   make server BUILD_PROFILE=debug     -g -O0 -fno-builtin (default)
-
 BUILD_PROFILE ?= debug
 
 SRC_DIR   := src
@@ -39,9 +25,8 @@ else
     QNX_CFLAGS += -g -O0 -fno-builtin
 endif
 
-# ---- Pi deployment settings ----
-# Uses the "qnxpi" alias from ~/.ssh/config -- update HostName there
-# when the Pi's IP changes, not here.
+# pi deployment
+# uses "qnxpi" alias from ~/.ssh/config containing ip address of the pi
 PI_USER := qnxuser
 PI_HOST := qnxpi
 PI_DIR  := /data/home/qnxuser/game
@@ -50,7 +35,7 @@ PI_DIR  := /data/home/qnxuser/game
 
 all: server
 
-# ---- Linux server (local testing) ----
+# linux server for local testing
 server: $(BUILD_DIR)/server_linux
 
 $(BUILD_DIR)/server_linux: $(SERVER_OBJS)
@@ -62,7 +47,7 @@ $(BUILD_DIR)/linux/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# ---- QNX AArch64 server (cross-compile, requires sourced qnxsdp-env.sh) ----
+# QNX AArch64 server
 qnx-server: $(BUILD_DIR)/server_qnx
 
 $(BUILD_DIR)/server_qnx: $(SERVER_QNX_OBJS)

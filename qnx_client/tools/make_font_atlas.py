@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
 """
-Regenerates src/font_atlas.h from the Public Pixel TTF.
-
-Public Pixel is CC0 1.0 Universal (GGBotNet,
-https://github.com/ggbotnet/fonts-cc0) -- public domain, no attribution
-required, safe to redistribute embedded in this project.
-
-This script is NOT part of the qnx_client build itself -- the build
-only ever compiles the already-generated src/font_atlas.h, matching
-this whole renderer's "no asset loaded at runtime" approach (same
-reasoning as QNX's own gles2-maze sample embedding its texture as a
-C header via `xxd -i` rather than loading a .tga file on the target).
-Run this only when you want to regenerate the atlas (e.g. a different
-font, a different character range, a different cell size).
-
 Usage:
     python3 make_font_atlas.py /path/to/PublicPixel.ttf ../src/font_atlas.h
 
@@ -22,13 +8,10 @@ Requires Pillow (pip install Pillow --break-system-packages).
 import sys
 from PIL import Image, ImageDraw, ImageFont
 
-CELL = 16          # px per glyph cell -- confirmed via font.getlength() that
-                   # every printable ASCII character in Public Pixel has an
-                   # identical 16px advance width at this render size, so a
-                   # fixed-size grid needs no per-glyph width table at all.
+CELL = 16          # px per glyph cell
 COLS = 16
-FIRST_CHAR = 32    # space
-LAST_CHAR = 126    # ~ -- full printable ASCII
+FIRST_CHAR = 32    
+LAST_CHAR = 126    
 
 
 def main():
@@ -57,10 +40,7 @@ def main():
         f.write(" * font_atlas.h -- Public Pixel font (GGBotNet, CC0 1.0 Universal,\n")
         f.write(" * https://github.com/ggbotnet/fonts-cc0), rasterized to a single-\n")
         f.write(" * channel (alpha-only) bitmap atlas at build time. Regenerate with\n")
-        f.write(" * tools/make_font_atlas.py -- this header IS the asset, same pattern\n")
-        f.write(" * as QNX's gles2-maze sample embedding brick_wall.tga as brick_wall.h\n")
-        f.write(" * via xxd -i, just single-channel and pre-decoded instead of a raw\n")
-        f.write(" * TGA file (so no runtime image-format parser is needed at all).\n")
+        f.write(" * tools/make_font_atlas.py \n")
         f.write(" *\n")
         f.write(f" * Layout: {COLS} columns, {CELL}x{CELL} px per cell, monospaced\n")
         f.write(f" * (every glyph has an identical {CELL}px advance width in the source\n")

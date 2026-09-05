@@ -1,14 +1,3 @@
-/*
- * server.c -- authoritative headless coop game server
- *
- * Runs on QNX Pi5 (or any POSIX host). No display, no platform layer.
- * All connected clients (Godot, on any OS) share ONE world. "Solo" vs
- * "Coop" is purely a client-side menu concept -- this server does not
- * distinguish sessions, it just simulates whoever is connected.
- *
- * Usage: ./server [port]
- */
-
 #include "common.h"
 #include "net.h"
 #include "map.h"
@@ -22,63 +11,26 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
-/* ------------------------------------------------------------------ */
-/* Game constants                                                       */
-/*                                                                      */
-/* COUPLING WARNING: MOVE_SPEED only affects the server's authoritative */
-/* position. The Godot client predicts its own movement locally for    */
-/* responsiveness (see godot_client/scripts/Player.gd's PLAYER_SPEED)  */
-/* rather than waiting on the network each frame, so changing this     */
-/* value alone won't visibly change movement -- you'll just see subtle */
-/* rubber-banding as the server's truth drifts from the client's guess.*/
-/* Keep them in sync: PLAYER_SPEED (world units/sec) = MOVE_SPEED       */
-/* (map units/tick) * NET_TICK_RATE (ticks/sec).                       */
-/* ------------------------------------------------------------------ */
 #define MOVE_SPEED      0.25f
-#define SHOOT_DAMAGE    25
+#define SHOOT_DAMAGE    10
 #define SHOOT_RANGE     100.0f /* can shoot long distances */
 #define AMMO_MAX        60
 #define RESPAWN_TICKS   (NET_TICK_RATE * 3)   /* 3 seconds */
-
-/* ------------------------------------------------------------------ */
-/* Pickups -- ammo/health packs. Spawn locations come from the map's   */
-/* tile-5 markers (see map_get_pickup_spawns), one pickup slot per     */
-/* marker, replicated per session so coop and every solo world each    */
-/* get their own independent set that doesn't interfere with others.   */
-/* ------------------------------------------------------------------ */
 #define PICKUP_RADIUS         0.6f
 #define PICKUP_RESPAWN_TICKS  (NET_TICK_RATE * 12)  /* 12 seconds */
 #define AMMO_PICKUP_AMOUNT    15
 #define HEALTH_PICKUP_AMOUNT  25
-
-/* Per-type zombie stats. Health is capped at 255 on purpose -- the wire
- * field (ZombieState.health) is a single byte, so BOSS_HEALTH is the
- * max a u8 can hold rather than a "real" boss-scale number. */
 #define ZOMBIE_SPEED   0.05f
-#define ZOMBIE_HEALTH  100
+#define ZOMBIE_HEALTH  40
 #define ZOMBIE_DAMAGE  20
-
-#define TANK_SPEED     0.04f   /* a little slower -- bulkier */
-#define TANK_HEALTH    180
+#define TANK_SPEED     0.04f   
+#define TANK_HEALTH    80
 #define TANK_DAMAGE    35
-
 #define BOSS_SPEED     0.035f
-#define BOSS_HEALTH    255
+#define BOSS_HEALTH    200
 #define BOSS_DAMAGE    50
-
 #define ZOMBIE_ATTACK_RANGE       0.8f
 #define ZOMBIE_ATTACK_COOLDOWN    (NET_TICK_RATE * 1)  /* 1 attack/sec */
-
-/* ------------------------------------------------------------------ */
-/* Wave design -- 4 waves, all on the one map (no separate arena):     */
-/*   Wave 1: 3 normal                                                   */
-/*   Wave 2: 5 normal + 1 tank (mini-boss)                              */
-/*   Wave 3: 7 normal + 3 tank                                          */
-/*   Wave 4: final boss                                                 */
-/* spawn_wave() is a no-op past WAVE_COUNT -- wave 4's boss is the last */
-/* thing that ever spawns for a session; no wave 5 follows.             */
-/* ------------------------------------------------------------------ */
 #define WAVE_COUNT 4
 
 typedef struct {
@@ -91,45 +43,15 @@ static const WaveDef WAVE_TABLE[WAVE_COUNT] = {
     { 3, 0, 0 },   /* wave 1 */
     { 5, 1, 0 },   /* wave 2 */
     { 7, 3, 0 },   /* wave 3 */
-    { 0, 0, 1 },   /* wave 4 -- final boss */
+    { 0, 0, 1 },   /* wave 4 */
 };
 
-/* Head/body hitbox split. The server has no real 3D geometry -- height
- * only ever existed as a client-side rendering convention -- so this
- * is a flat approximation: given the shooter's eye height, vertical
- * aim (pitch), and horizontal distance to the target (already known
- * from shoot_check's cone test), we compute where a straight line at
- * that pitch would cross the target's vertical column, then classify
- * that height against the zombie's head/body split.
- *
- * COUPLING WARNING: PLAYER_EYE_HEIGHT must match Player.gd's camera
- * height (PLAYER_HEIGHT - 0.2), and ZOMBIE_HEIGHT must match
- * Zombie.gd's HEIGHT constant. If those drift apart, headshots will
- * be classified against a target that's taller/shorter on screen than
- * what the server thinks it's aiming at. */
 #define PLAYER_EYE_HEIGHT   1.4f
 #define ZOMBIE_HEIGHT        1.8f
-#define HEAD_ZONE_FRACTION   0.25f   /* top quarter of ZOMBIE_HEIGHT is head */
-#define HEADSHOT_DAMAGE       50
-
-/* Zombie ramp/platform climbing. This is a deliberate approximation,
- * not a full port of LevelBuilder.gd's per-tile ramp-chain math: the
- * server doesn't know which ramp tile is which step of which chain,
- * it only knows the raw tile type under a zombie's feet right now.
- * So target height is just "0 on floor, halfway up while anywhere on
- * a ramp tile, full height on a platform tile", eased toward smoothly
- * each tick rather than snapped -- looks like climbing/dropping in
- * practice even though it doesn't trace the exact ramp slope the way
- * the player's real physics-based climb does.
- *
- * COUPLING WARNING: PLATFORM_HEIGHT must match LevelBuilder.gd's
- * PLATFORM_HEIGHT, or a zombie will visually stand at the wrong
- * height relative to the platform mesh the client actually drew. */
+#define HEAD_ZONE_FRACTION   0.25f   
+#define HEADSHOT_DAMAGE       40
 #define PLATFORM_HEIGHT   2.0f
 #define RAMP_MID_HEIGHT   (PLATFORM_HEIGHT * 0.5f)
-/* COUPLING: mirrors qnx_client's CLIMB_SPEED_UP/DOWN in main.c, so
- * zombies feel the same "weight" as the player -- falling faster
- * than rising, rather than floating at a uniform rate either way. */
 #define ZOMBIE_CLIMB_SPEED_UP   3.0f
 #define ZOMBIE_CLIMB_SPEED_DOWN 8.0f
 
@@ -137,36 +59,24 @@ static const WaveDef WAVE_TABLE[WAVE_COUNT] = {
 static const f32 SPAWN_X[SPAWN_COUNT] = { 2.5f, 21.5f,  2.5f, 21.5f };
 static const f32 SPAWN_Y[SPAWN_COUNT] = { 2.5f,  2.5f, 21.5f, 21.5f };
 static const f32 SPAWN_A[SPAWN_COUNT] = { 0.0f,  3.14f,  1.57f, 4.71f };
-
-/* Zombie spawn points -- all verified open floor tiles in map.c,
- * spread across the middle of the map, away from player spawn corners.
- * Index 3 was originally (12.5, 11.5), which the map redesign moved
- * onto the elevated platform -- fixed to (12.5, 6.5), still open floor,
- * still roughly central. */
 #define ZOMBIE_SPAWN_COUNT 8
 static const f32 ZOMBIE_SPAWN_X[ZOMBIE_SPAWN_COUNT] =
     { 8.5f, 15.5f, 4.5f, 12.5f, 19.5f, 8.5f, 15.5f, 12.5f };
 static const f32 ZOMBIE_SPAWN_Y[ZOMBIE_SPAWN_COUNT] =
     { 2.5f,  2.5f, 11.5f,  6.5f, 11.5f, 21.5f, 21.5f, 20.5f };
-
-/* Dedicated boss entrance point -- north-center, clearly clear of the
- * platform/ramp structure and away from every player spawn corner. */
+    
 #define BOSS_SPAWN_X 12.5f
 #define BOSS_SPAWN_Y 3.5f
 
-/* ------------------------------------------------------------------ */
-/* Server player                                                        */
-/* ------------------------------------------------------------------ */
 typedef struct {
     int                active;
     struct sockaddr_in addr;
-    u8                 session_id;   /* 0 = coop (shared); N+1 = solo player N's private world */
+    u8                 session_id;   
     f32                x, y, angle;
     u8                 health;
     u8                 ammo;
     int                alive;
     int                respawn_timer;
-    /* buffered input from latest PKT_INPUT */
     u8                 inp_forward;
     u8                 inp_back;
     u8                 inp_strafe_l;
@@ -181,20 +91,14 @@ typedef struct {
     int active;
     int alive;
     u8  session_id;
-    u8  type;           /* ZOMBIE_TYPE_NORMAL / TANK / BOSS */
+    u8  type;           
     f32 x, y;
-    f32 z;              /* height above floor -- see zombie_tick's COUPLING WARNING */
+    f32 z;              
     u8  health;
-    u8  health_max;      /* set at spawn from the per-type constant, sent on the wire
-                           * so the client's health bar percentage is correct */
+    u8  health_max;      
     int attack_cooldown;
 } ServerZombie;
 
-/* One pickup slot per map marker. type/x/y are fixed at startup (from
- * the map); active/respawn_timer are the only things that change per
- * session, so this is indexed [session_id][spawn_index] rather than
- * being a dynamic free-list like g_zombies -- there's always exactly
- * one pickup "slot" at each marker, it's just on cooldown or not. */
 typedef struct {
     int active;
     int respawn_timer;
@@ -208,23 +112,15 @@ static f32 g_pickup_spawn_y[MAX_PICKUP_SPAWNS];
 static u8  g_pickup_spawn_type[MAX_PICKUP_SPAWNS];
 static int g_pickup_spawn_count = 0;
 
-/* Session 0 = coop (shared world). Sessions 1..NET_MAX_PLAYERS are
- * private solo worlds, one per player slot -- a solo player's session
- * id is just their own slot index + 1, which is trivially unique
- * without needing room codes or a lobby system. */
 #define SESSION_COOP  0u
 #define SESSION_COUNT (NET_MAX_PLAYERS + 1)
 
-/* [session_id][spawn_index] -- see ServerPickup comment above. */
 static ServerPickup g_pickups[SESSION_COUNT][MAX_PICKUP_SPAWNS];
 
 static u8           g_wave[SESSION_COUNT];
 static int          g_sock = -1;
 static u32          g_tick = 0;
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                              */
-/* ------------------------------------------------------------------ */
 static double mono_time(void)
 {
     return portable_time();
@@ -260,10 +156,9 @@ static int alloc_player(struct sockaddr_in *addr, u8 mode)
         g_players[i].alive  = 1;
         return i;
     }
-    return -1;   /* server full */
+    return -1;   
 }
 
-/* Attempt move; slide against walls independently on each axis */
 static void player_move(ServerPlayer *p, f32 dx, f32 dy)
 {
     if (!map_is_wall((int)(p->x + dx), (int)p->y)) p->x += dx;
@@ -287,10 +182,6 @@ static int any_player_connected_in(u8 session_id)
     return 0;
 }
 
-/* Finds a free zombie slot and fills it in as `type` at (x,y). Health
- * (current + max) comes from the per-type constants so tank/boss are
- * meaningfully tankier than a normal zombie. Returns 1 if a slot was
- * found and used, 0 if MAX_ZOMBIES is already full. */
 static int spawn_one_zombie(u8 session_id, u8 type, f32 x, f32 y)
 {
     int i;
@@ -317,16 +208,13 @@ static int spawn_one_zombie(u8 session_id, u8 type, f32 x, f32 y)
     return 0;
 }
 
-/* Spawns the next wave for a session per WAVE_TABLE. No-op past
- * WAVE_COUNT -- the session has already beaten the boss and no
- * further wave follows. */
 static void spawn_wave(u8 session_id)
 {
     u8 w = g_wave[session_id] + 1;
     int spawned = 0, i;
     const WaveDef *def;
 
-    if (w > WAVE_COUNT) return;   /* boss already defeated -- session is over */
+    if (w > WAVE_COUNT) return;   
     g_wave[session_id] = w;
     def = &WAVE_TABLE[w - 1];
 
@@ -336,8 +224,6 @@ static void spawn_wave(u8 session_id)
         if (spawn_one_zombie(session_id, ZOMBIE_TYPE_NORMAL, x, y)) spawned++;
     }
     for (i = 0; i < def->tank_count; i++) {
-        /* offset the index so tanks don't land on the exact same tiles
-         * as the normals that were just placed above */
         int idx = i + def->normal_count;
         f32 x = ZOMBIE_SPAWN_X[idx % ZOMBIE_SPAWN_COUNT];
         f32 y = ZOMBIE_SPAWN_Y[idx % ZOMBIE_SPAWN_COUNT];
@@ -351,9 +237,6 @@ static void spawn_wave(u8 session_id)
            session_id, w, def->normal_count, def->tank_count, def->boss_count, spawned);
 }
 
-/* Called once at startup. Reads pickup spawn points from the map and
- * marks every session's copy of each slot as active, alternating ammo
- * and health so packs are a mix rather than all-ammo or all-health. */
 static void init_pickups(void)
 {
     int i, s;
@@ -369,10 +252,6 @@ static void init_pickups(void)
     printf("Loaded %d pickup spawn points from map\n", g_pickup_spawn_count);
 }
 
-/* Checks one player against every pickup in their session and applies
- * whichever packs they're standing on. Only consumes a pack if it
- * actually helps (below max ammo/health) -- so a topped-up player
- * passing through leaves it for a teammate who needs it more. */
 static void pickup_tick_for_player(ServerPlayer *p)
 {
     int i;
@@ -404,8 +283,6 @@ static void pickup_tick_for_player(ServerPlayer *p)
     }
 }
 
-/* Ticks down respawn timers for every session's pickups. Cheap to run
- * unconditionally (SESSION_COUNT * MAX_PICKUP_SPAWNS is tiny). */
 static void pickup_respawn_tick(void)
 {
     int s, i;
@@ -417,22 +294,6 @@ static void pickup_respawn_tick(void)
         }
 }
 
-/* Hitscan: return id of nearest ALIVE ZOMBIE whose body the shooter's
- * aim ray actually passes through, or -1. No PvP -- players only ever
- * damage zombies.
- *
- * This is a proper line-vs-circle test, not a fixed angular cone: the
- * "cone" version was forgiving at any distance and unrelated to how
- * big the zombie actually looks on screen. Here we project the
- * zombie's position onto the aim ray to find the closest approach
- * point, then check how far off that ray the zombie actually is
- * (perpendicular distance) against its real radius -- i.e. does the
- * crosshair genuinely overlap the model, the same way a hitscan
- * weapon works in any normal FPS.
- *
- * COUPLING WARNING: ZOMBIE_RADIUS should match (or be slightly
- * smaller than -- never larger than) Zombie.gd's CapsuleMesh radius,
- * or the hitbox won't match what's rendered on screen. */
 #define ZOMBIE_RADIUS 0.35f
 
 static int shoot_check(int shooter_id)
@@ -440,7 +301,7 @@ static int shoot_check(int shooter_id)
     ServerPlayer *sh = &g_players[shooter_id];
     f32 rx = cosf(sh->angle);
     f32 ry = sinf(sh->angle);
-    f32 best = SHOOT_RANGE;   /* tracks closest qualifying hit, along the ray */
+    f32 best = SHOOT_RANGE;   
     int hit  = -1;
     int i;
 
@@ -450,16 +311,12 @@ static int shoot_check(int shooter_id)
         f32 dx = g_zombies[i].x - sh->x;
         f32 dy = g_zombies[i].y - sh->y;
 
-        /* proj = how far along the aim ray the zombie's closest
-         * approach point is. Negative means it's behind the shooter. */
         f32 proj = dx*rx + dy*ry;
         if (proj <= 0.0f || proj >= best) continue;
 
-        /* perp = how far off the ray (off-crosshair) the zombie
-         * actually is at that closest approach point. */
         f32 dist_sq = dx*dx + dy*dy;
         f32 perp_sq = dist_sq - proj*proj;
-        if (perp_sq < 0.0f) perp_sq = 0.0f;   /* guard tiny float error */
+        if (perp_sq < 0.0f) perp_sq = 0.0f;   
         if (perp_sq > ZOMBIE_RADIUS * ZOMBIE_RADIUS) continue;
 
         best = proj;
@@ -468,11 +325,6 @@ static int shoot_check(int shooter_id)
     return hit;
 }
 
-/* Classify an ALREADY-CONFIRMED hit (from shoot_check) as head or
- * body, using the shooter's vertical aim and horizontal distance to
- * the target. This never changes WHETHER something got hit -- only
- * whether it counts as a headshot -- so shoot_check's existing
- * horizontal targeting/miss behavior is completely untouched. */
 static int classify_headshot(int shooter_id, int zombie_id)
 {
     ServerPlayer *sh = &g_players[shooter_id];
@@ -481,8 +333,6 @@ static int classify_headshot(int shooter_id, int zombie_id)
     f32 dy   = z->y - sh->y;
     f32 dist = sqrtf(dx*dx + dy*dy);
 
-    /* Where a straight line at the shooter's pitch crosses the
-     * target's vertical column, relative to the floor. */
     f32 hit_y = PLAYER_EYE_HEIGHT + dist * tanf(sh->inp_pitch);
     if (hit_y < 0.0f)          hit_y = 0.0f;
     if (hit_y > ZOMBIE_HEIGHT) hit_y = ZOMBIE_HEIGHT;
@@ -491,9 +341,6 @@ static int classify_headshot(int shooter_id, int zombie_id)
     return (hit_y >= head_threshold) ? 1 : 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Packet sending                                                       */
-/* ------------------------------------------------------------------ */
 static void send_to(int player_id, const void *pkt, size_t len)
 {
     sendto(g_sock, pkt, len, 0,
@@ -569,9 +416,6 @@ static void send_state_to_session(u8 session_id)
             send_to(i, &pkt, sizeof(pkt));
 }
 
-/* One PktState per active session, instead of one global broadcast --
- * this is the actual fix for solo/coop bleeding into each other:
- * players in different sessions now get entirely separate snapshots. */
 static void broadcast_state(void)
 {
     u8 s;
@@ -597,16 +441,6 @@ static void broadcast_hit(u8 session_id, u8 victim_id, u8 victim_type, u8 attack
             send_to(i, &pkt, sizeof(pkt));
 }
 
-/* Full reset of a session for "replay" after beating wave 4 -- wave
- * counter, every zombie belonging to the session, every pickup's
- * cooldown, and every currently-connected player's health/ammo/
- * position in that session (in coop, one player choosing replay
- * restarts it for the whole team, matching a shared-world session's
- * "we all just beat it together" framing). Ends by calling
- * spawn_wave() directly rather than relying on the per-tick "zombie
- * count reached zero" check to notice -- immediate feels right for
- * an explicit player action, and mirrors how PKT_CONNECT already
- * kicks off wave 1 immediately rather than waiting a tick. */
 static void reset_session(u8 sid)
 {
     int i;
@@ -639,9 +473,6 @@ static void reset_session(u8 sid)
     printf("Session %d: reset for replay\n", sid);
 }
 
-/* ------------------------------------------------------------------ */
-/* Receive loop                                                         */
-/* ------------------------------------------------------------------ */
 static void recv_packets(void)
 {
     u8                 buf[1024];
@@ -667,15 +498,6 @@ static void recv_packets(void)
                 printf("Player %d connected (session %d, %s)  %s:%d\n",
                        id, sid, c->mode == CONNECT_MODE_SOLO ? "solo" : "coop",
                        inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-                /* Only auto-start wave 1 for a session that hasn't
-                 * played at all yet. Without the g_wave==0 guard, a
-                 * player reconnecting mid-run (or a second coop player
-                 * joining between waves) could re-trigger spawn_wave()
-                 * on top of whatever wave is already in progress --
-                 * spawn_wave() isn't idempotent (it always increments
-                 * g_wave), so this could silently double-advance the
-                 * wave counter if it fires the same tick as the normal
-                 * wave-clear check below. */
                 if (g_wave[sid] == 0)
                     spawn_wave(sid);
             }
@@ -701,8 +523,13 @@ static void recv_packets(void)
         case PKT_DISCONNECT: {
             int id = find_player(&from);
             if (id >= 0) {
+                u8 sid = g_players[id].session_id;
                 printf("Player %d disconnected\n", id);
                 g_players[id].active = 0;
+
+                if (!any_player_connected_in(sid)) {
+                    reset_session(sid);
+                }
             }
             break;
         }
@@ -720,15 +547,6 @@ static void recv_packets(void)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Zombie AI tick                                                       */
-/* ------------------------------------------------------------------ */
-
-/* Moves z toward whatever height the tile under the zombie's feet
- * implies, at asymmetric rates (falling faster than climbing, for a
- * "weight" feel) -- see the ZOMBIE_CLIMB_SPEED_UP/DOWN COUPLING
- * WARNING above for why this is an approximation rather than a true
- * ramp-slope trace. */
 static void zombie_height_tick(ServerZombie *z)
 {
     int tile = map_tile((int)z->x, (int)z->y);
@@ -750,8 +568,6 @@ static void zombie_height_tick(ServerZombie *z)
     }
 }
 
-/* Per-type movement speed and attack damage -- see the ZOMBIE_SPEED /
- * TANK_SPEED / BOSS_SPEED and *_DAMAGE constants near the wave table. */
 static f32 zombie_speed_for(u8 type)
 {
     switch (type) {
@@ -779,7 +595,6 @@ static void zombie_tick(void)
 
         zombie_height_tick(z);
 
-        /* find nearest alive player in the SAME session */
         int target = -1;
         f32 best_dist = 1e9f;
         for (p = 0; p < NET_MAX_PLAYERS; p++) {
@@ -790,7 +605,7 @@ static void zombie_tick(void)
             f32 d  = sqrtf(dx*dx + dy*dy);
             if (d < best_dist) { best_dist = d; target = p; }
         }
-        if (target < 0) continue;   /* nobody alive to chase in this session */
+        if (target < 0) continue;   
 
         f32 dx   = g_players[target].x - z->x;
         f32 dy   = g_players[target].y - z->y;
@@ -817,8 +632,6 @@ static void zombie_tick(void)
         if (z->attack_cooldown > 0) z->attack_cooldown--;
     }
 
-    /* Next wave once the current session's zombies are fully cleared
-     * (and someone in that session is still playing) */
     {
         u8 s;
         for (s = 0; s < SESSION_COUNT; s++)
@@ -827,9 +640,6 @@ static void zombie_tick(void)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Game tick (called NET_TICK_RATE times per second)                   */
-/* ------------------------------------------------------------------ */
 static void game_tick(void)
 {
     int i;
@@ -859,7 +669,6 @@ static void game_tick(void)
 
         pickup_tick_for_player(p);
 
-        /* Rising-edge shoot -- zombies only, no PvP */
         if (p->inp_shoot && !p->inp_shoot_prev && p->ammo > 0) {
             p->ammo--;
             int hit = shoot_check(i);
@@ -867,7 +676,7 @@ static void game_tick(void)
                 ServerZombie *z    = &g_zombies[hit];
                 int headshot       = classify_headshot(i, hit);
                 u32 raw_dmg        = headshot ? HEADSHOT_DAMAGE : SHOOT_DAMAGE;
-                u8  dmg            = (raw_dmg > 255u) ? 255u : (u8)raw_dmg;  /* wire field is one byte */
+                u8  dmg            = (raw_dmg > 255u) ? 255u : (u8)raw_dmg;  
 
                 z->health = (z->health > dmg) ? z->health - dmg : 0;
                 broadcast_hit(p->session_id, (u8)hit, ENTITY_ZOMBIE, (u8)i, dmg, (u8)headshot);
@@ -886,9 +695,6 @@ static void game_tick(void)
     pickup_respawn_tick();
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                 */
-/* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
     u16 port = NET_PORT;

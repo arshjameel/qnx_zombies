@@ -1,21 +1,8 @@
 extends Node
-## Autoload: Network
-##
-## Re-implements src/net.h by hand since GDScript can't #include a C
-## header. Every struct here MUST match the C side byte-for-byte:
-## same field order, same sizes, no padding (the C side uses
-## #pragma pack(push,1)), little-endian (Godot's StreamPeerBuffer
-## defaults to little-endian, which matches ARM/x86 native order).
-##
-## If you change src/net.h, mirror the change here or the client and
-## server will silently desync -- often NOT with a crash, just a
-## connect that quietly never succeeds (PKT_CONNECT growing a `mode`
-## byte did exactly this) or a new field nobody parses.
 
-# ---- protocol constants (mirror net.h) ----
 const NET_MAX_PLAYERS := 8
 const MAX_ZOMBIES := 16
-const MAX_PICKUP_SPAWNS := 16   # must match map.h's MAX_PICKUP_SPAWNS
+const MAX_PICKUP_SPAWNS := 16   
 
 const PKT_CONNECT    := 0x01
 const PKT_ACCEPT     := 0x02
@@ -34,7 +21,6 @@ const CONNECT_MODE_SOLO := 1
 const PICKUP_AMMO   := 0
 const PICKUP_HEALTH := 1
 
-# ---- fixed struct sizes, in bytes (must match net.h exactly) ----
 const HEADER_SIZE       := 6    # u8 + u8 + u32
 const CONNECT_SIZE      := HEADER_SIZE + 1                          # 7
 const ACCEPT_SIZE       := HEADER_SIZE + 1 + 4 + 4 + 4              # 19
@@ -52,10 +38,9 @@ signal disconnected_from_server()
 var my_id: int = -1
 var is_connected: bool = false
 
-# Latest authoritative snapshot, keyed by id. Populated from PKT_STATE.
-var players: Dictionary = {}   # id -> {alive, x, y, angle, health, ammo}
-var zombies: Dictionary = {}   # id -> {alive, type, x, y, z, health, health_max}
-var pickups: Dictionary = {}   # id -> {type, active, x, y}
+var players: Dictionary = {}   
+var zombies: Dictionary = {}   
+var pickups: Dictionary = {}   
 var wave: int = 0
 
 var _udp: PacketPeerUDP = PacketPeerUDP.new()
@@ -80,10 +65,6 @@ func _process(delta: float) -> void:
 			_send_connect()
 			_connect_retry_timer = CONNECT_RETRY_INTERVAL
 
-## Call from the menu when the player picks Solo or Coop. `mode` should
-## be CONNECT_MODE_SOLO or CONNECT_MODE_COOP -- the server uses it to
-## decide which session (shared world, or this player's own private
-## one) to place the connecting player into.
 func begin_connect(ip: String, port: int, mode: int = CONNECT_MODE_COOP) -> void:
 	reset()
 	_connect_mode = mode
@@ -93,7 +74,7 @@ func begin_connect(ip: String, port: int, mode: int = CONNECT_MODE_COOP) -> void
 		return
 	_connecting = true
 	_connect_elapsed = 0.0
-	_connect_retry_timer = 0.0  # send immediately on next _process
+	_connect_retry_timer = 0.0  
 
 func reset() -> void:
 	my_id = -1
@@ -112,7 +93,6 @@ func send_disconnect() -> void:
 	_udp.put_packet(pba.data_array)
 	is_connected = false
 
-## Call once per physics frame while playing.
 func send_input(forward: bool, back: bool, left: bool, right: bool,
 		look_angle: float, shoot: bool, pitch: float) -> void:
 	if not is_connected:
@@ -200,11 +180,8 @@ func _poll_incoming() -> void:
 						}
 				wave = pba.get_u8()
 
-				# Pickups -- appended at the end of PktState on the C
-				# side specifically so this is the only new block
-				# needed here; nothing above this point changed shape.
 				var new_pickups := {}
-				if bytes.size() >= HEADER_SIZE + 1 + 1:  # at least room for pickup_count itself
+				if bytes.size() >= HEADER_SIZE + 1 + 1:  
 					var pickup_count := pba.get_u8()
 					for i in range(MAX_PICKUP_SPAWNS):
 						var pkid := pba.get_u8()
@@ -232,4 +209,4 @@ func _poll_incoming() -> void:
 				hit_event.emit(victim_id, victim_type, attacker_id, damage, headshot)
 
 			_:
-				pass  # unknown packet type, ignore
+				pass  

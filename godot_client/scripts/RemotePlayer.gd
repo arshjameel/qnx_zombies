@@ -1,8 +1,5 @@
 extends Node3D
 class_name RemotePlayer
-## One instance per OTHER connected player (never the local player --
-## that's Player.gd). Purely visual; the server is authoritative for
-## position, we just lerp toward whatever it last reported.
 
 const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
 
@@ -21,7 +18,7 @@ func _ready() -> void:
 	_mesh_inst.mesh = capsule
 	_mesh_inst.position = Vector3(0, HEIGHT / 2.0, 0)
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.9, 0.75, 0.1)   # yellow -- teammate
+	mat.albedo_color = Color(0.9, 0.75, 0.1)   # yellow teammate
 	_mesh_inst.material_override = mat
 	add_child(_mesh_inst)
 

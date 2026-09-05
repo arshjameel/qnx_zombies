@@ -1,16 +1,9 @@
-/*
- * text_render.c -- see text_render.h for the overview.
- */
-
 #include "text_render.h"
 #include "font_atlas.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* Same pixel-to-NDC convention as hud_render.c's px_to_ndc(), kept as
- * its own small copy rather than a cross-module dependency for
- * something this tiny -- both modules stay independent. */
 static void px_to_ndc(f32 px, f32 py, int win_w, int win_h, f32 *nx, f32 *ny)
 {
     *nx = (px / (f32)win_w) * 2.0f - 1.0f;
@@ -37,8 +30,6 @@ void text_vlist_free(TextVertexList *vl)
     vl->count = vl->capacity = 0;
 }
 
-/* One glyph quad: pixel-space (px0,py0)-(px1,py1) mapped to NDC, UVs
- * looked up from the atlas grid for this ASCII code. */
 static void push_glyph(TextVertexList *vl, int code, f32 px0, f32 py0, f32 px1, f32 py1,
                        int win_w, int win_h, f32 r, f32 g, f32 b)
 {
@@ -72,8 +63,7 @@ void text_push_string(TextVertexList *vl, const char *str, f32 px, f32 py,
         int code = (unsigned char)*c;
         if (code >= FONT_ATLAS_FIRST_CHAR && code <= FONT_ATLAS_LAST_CHAR) {
             push_glyph(vl, code, x, py, x + char_w, py + char_h, win_w, win_h, r, g, b);
-        }
-        /* still advance on an unsupported byte -- see header comment */
+        }        
         x += char_w;
     }
 }

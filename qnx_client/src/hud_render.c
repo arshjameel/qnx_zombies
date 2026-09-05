@@ -1,7 +1,3 @@
-/*
- * hud_render.c -- see hud_render.h for the overview.
- */
-
 #include "hud_render.h"
 #include <stdio.h>
 #include <string.h>
@@ -9,7 +5,7 @@
 static void px_to_ndc(f32 px, f32 py, int win_w, int win_h, f32 *nx, f32 *ny)
 {
     *nx = (px / (f32)win_w) * 2.0f - 1.0f;
-    *ny = 1.0f - (py / (f32)win_h) * 2.0f;   /* screen Y grows down, NDC Y grows up */
+    *ny = 1.0f - (py / (f32)win_h) * 2.0f;  
 }
 
 void hud_push_quad(VertexList *vl, f32 x0, f32 y0, f32 x1, f32 y1,
@@ -18,11 +14,7 @@ void hud_push_quad(VertexList *vl, f32 x0, f32 y0, f32 x1, f32 y1,
     f32 nx0, ny0, nx1, ny1;
     px_to_ndc(x0, y0, win_w, win_h, &nx0, &ny0);
     px_to_ndc(x1, y1, win_w, win_h, &nx1, &ny1);
-    /* z=0 -- HUD is drawn with depth test disabled, see main.c.
-     * Normal (0,0,1) is a dummy -- the HUD/entity shader program
-     * doesn't declare a_normal at all, so this is never read; it's
-     * only here because the vertex buffer layout is shared with the
-     * level geometry, which does use it. */
+    
     vlist_push(vl, nx0, ny0, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
     vlist_push(vl, nx1, ny0, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
     vlist_push(vl, nx1, ny1, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
@@ -31,9 +23,6 @@ void hud_push_quad(VertexList *vl, f32 x0, f32 y0, f32 x1, f32 y1,
     vlist_push(vl, nx0, ny1, 0.0f, 0.0f, 0.0f, 1.0f, r, g, b);
 }
 
-/* Standard 7-segment hardware display encoding -- universal, not
- * QNX-specific. bit0=a(top) bit1=b(top-right) bit2=c(bottom-right)
- * bit3=d(bottom) bit4=e(bottom-left) bit5=f(top-left) bit6=g(middle) */
 static const unsigned char DIGIT_SEGMENTS[10] = {
     0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F,
 };
@@ -49,11 +38,11 @@ void hud_push_digit(VertexList *vl, int digit, f32 px, f32 py, f32 pw, f32 ph,
     seg = DIGIT_SEGMENTS[digit];
 
     if (seg & 0x01) hud_push_quad(vl, px, py, px + pw, py + thick, win_w, win_h, r, g, b);                     /* a: top */
-    if (seg & 0x02) hud_push_quad(vl, px + pw - thick, py, px + pw, mid_y, win_w, win_h, r, g, b);             /* b: top-right */
-    if (seg & 0x04) hud_push_quad(vl, px + pw - thick, mid_y, px + pw, py + ph, win_w, win_h, r, g, b);        /* c: bottom-right */
+    if (seg & 0x02) hud_push_quad(vl, px + pw - thick, py, px + pw, mid_y, win_w, win_h, r, g, b);             /* b: top right */
+    if (seg & 0x04) hud_push_quad(vl, px + pw - thick, mid_y, px + pw, py + ph, win_w, win_h, r, g, b);        /* c: bottom right */
     if (seg & 0x08) hud_push_quad(vl, px, py + ph - thick, px + pw, py + ph, win_w, win_h, r, g, b);           /* d: bottom */
-    if (seg & 0x10) hud_push_quad(vl, px, mid_y, px + thick, py + ph, win_w, win_h, r, g, b);                  /* e: bottom-left */
-    if (seg & 0x20) hud_push_quad(vl, px, py, px + thick, mid_y, win_w, win_h, r, g, b);                       /* f: top-left */
+    if (seg & 0x10) hud_push_quad(vl, px, mid_y, px + thick, py + ph, win_w, win_h, r, g, b);                  /* e: bottom left */
+    if (seg & 0x20) hud_push_quad(vl, px, py, px + thick, mid_y, win_w, win_h, r, g, b);                       /* f: top left */
     if (seg & 0x40) hud_push_quad(vl, px, mid_y - thick * 0.5f, px + pw, mid_y + thick * 0.5f, win_w, win_h, r, g, b); /* g: middle */
 }
 
@@ -65,7 +54,7 @@ void hud_push_number(VertexList *vl, int value, f32 px, f32 py, f32 digit_w, f32
     f32  x = px;
     f32  spacing = digit_w * 1.3f;
 
-    if (value < 0) value = 0;   /* every HUD value (health/ammo/wave/count) is non-negative */
+    if (value < 0) value = 0;   
     snprintf(buf, sizeof(buf), "%d", value);
 
     for (i = 0; buf[i] != '\0'; i++) {

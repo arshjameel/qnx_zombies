@@ -1,25 +1,23 @@
 extends Node3D
 
-# Loaded by path instead of by class_name. class_name types only resolve
-# once Godot has built its global class cache (which needs either the
-# editor to have scanned the project, or -- on a fresh checkout -- a
-# "Reload Current Project"). The QNX Developer Desktop runs this via
-# godot-template-release with no editor and no such scan step, so we
-# don't rely on it at all: preload() always works, cache or no cache.
 const PlayerScript       := preload("res://scripts/Player.gd")
 const LevelBuilderScript := preload("res://scripts/LevelBuilder.gd")
 const HUDScript          := preload("res://scripts/HUD.gd")
 const RemotePlayerScript := preload("res://scripts/RemotePlayer.gd")
 const ZombieScript       := preload("res://scripts/Zombie.gd")
 const PickupScript       := preload("res://scripts/Pickup.gd")
+const WinPopupScript     := preload("res://scripts/WinPopup.gd")
+
+const WAVE_COUNT := 4
 
 var _player: CharacterBody3D = null
-var _remote_players: Dictionary = {}   # id -> RemotePlayer node
-var _zombies: Dictionary = {}          # id -> Zombie node
-var _pickups: Dictionary = {}          # id -> Pickup node
+var _remote_players: Dictionary = {}   
+var _zombies: Dictionary = {}          
+var _pickups: Dictionary = {}          
 var _level: Node3D
 var _entities_root: Node3D
 var _hud: CanvasLayer
+var _win_popup_shown: bool = false  
 
 func _ready() -> void:
 	var env := WorldEnvironment.new()
@@ -57,15 +55,31 @@ func _on_connected(my_id: int, spawn_x: float, spawn_y: float, _spawn_angle: flo
 	_player = PlayerScript.new()
 	add_child(_player)
 	_player.global_position = LevelBuilderScript.map_to_world(spawn_x, spawn_y, 0.0)
-	# Not bothering to convert spawn_angle into an exact initial yaw --
-	# it's a cosmetic starting facing direction and self-corrects the
-	# instant the player moves the mouse.
+	
 	print("Connected as player %d" % my_id)
 
 func _on_state_updated() -> void:
 	_sync_remote_players()
 	_sync_zombies()
 	_sync_pickups()
+	_check_win_condition()
+
+func _check_win_condition() -> void:
+	if _win_popup_shown:
+		return
+	if Network.wave >= WAVE_COUNT and Network.zombies.is_empty():
+		_win_popup_shown = true
+		_show_win_popup()
+
+func _show_win_popup() -> void:
+	var popup := WinPopupScript.new()
+	add_child(popup)
+	popup.quit_to_menu_pressed.connect(_quit_to_menu)
+	popup.quit_game_pressed.connect(_quit_game)
+
+func _quit_game() -> void:
+	Network.send_disconnect()
+	get_tree().quit()
 
 func _sync_remote_players() -> void:
 	var seen := {}
@@ -102,10 +116,6 @@ func _sync_zombies() -> void:
 			_zombies.erase(id)
 
 func _sync_pickups() -> void:
-	# Pickups never disappear from Network.pickups (a slot just toggles
-	# active/inactive while on cooldown), so unlike zombies this never
-	# needs the queue_free()-on-missing cleanup path -- once created,
-	# a Pickup node lives for the whole session and just shows/hides.
 	for id in Network.pickups.keys():
 		if not _pickups.has(id):
 			var pk := PickupScript.new()

@@ -5,7 +5,7 @@ var _health_label: Label
 var _ammo_label: Label
 var _wave_label: Label
 var _feed_label: RichTextLabel
-var _feed_lines: Array = []   # [{text, ttl}]
+var _feed_lines: Array = []  
 
 var _health_bar: ProgressBar
 var _health_bar_label: Label
@@ -28,10 +28,8 @@ func _ready() -> void:
 	crosshair_wrap.add_child(crosshair)
 
 	_health_label = _make_label(24, 16, 22)
-	#add_child(_health_label)
 
 	_ammo_label = _make_label(24, 48, 22)
-	#add_child(_ammo_label)
 
 	_zombies_label = _make_label(24, 16, 22)
 	add_child(_zombies_label)
@@ -54,7 +52,6 @@ func _ready() -> void:
 	_feed_label.add_theme_font_size_override("normal_font_size", 18)
 	add_child(_feed_label)
 
-	# Bottom-left health bar
 	_health_bar = ProgressBar.new()
 	_health_bar.min_value = 0
 	_health_bar.max_value = 100
@@ -74,7 +71,6 @@ func _ready() -> void:
 	_health_bar_label.position = Vector2(20, -48)
 	add_child(_health_bar_label)
 
-	# Bottom-right ammo count
 	_ammo_label_bottom = Label.new()
 	_ammo_label_bottom.add_theme_font_size_override("font_size", 24)
 	_ammo_label_bottom.size = Vector2(150, 28)

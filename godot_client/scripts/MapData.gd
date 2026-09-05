@@ -1,12 +1,7 @@
 extends Node
 class_name MapData
-## Autoload-free helper (used as a regular class, not a singleton).
-## Mirrors src/map.c exactly: 0=floor, 1=grey/2=blue/3=red/4=green wall,
-## 5=pickup spawn marker, 6=ramp, 7=elevated platform. Keep this in
-## sync if map.c ever changes -- this GRID had drifted out of sync
-## with the pickup markers your friend added (harmless so far, since
-## Pickup.gd renders from server-reported positions, not from this
-## grid, but is_wall() below was also wrong until now).
+# 0=floor, 1=grey/2=blue/3=red/4=green wall,
+# 5=pickup spawn marker, 6=ramp, 7=elevated platform.
 
 const MAP_W := 24
 const MAP_ROWS := 24
@@ -53,7 +48,7 @@ static func is_wall(mx: int, my: int) -> bool:
 	if mx < 0 or mx >= MAP_W or my < 0 or my >= MAP_ROWS:
 		return true
 	var t: int = GRID[my][mx]
-	return t >= 1 and t <= 4   # only wall types block movement, matching map.c's map_is_wall
+	return t >= 1 and t <= 4   
 
 static func tile(mx: int, my: int) -> int:
 	if mx < 0 or mx >= MAP_W or my < 0 or my >= MAP_ROWS:

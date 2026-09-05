@@ -1,7 +1,3 @@
-/*
- * level_geo.c -- see level_geo.h for the overview.
- */
-
 #include "level_geo.h"
 #include "mat4.h"
 #include "map.h"
@@ -17,9 +13,6 @@
 #define PLATFORM_THICKNESS 0.25f
 #define RAMP_THICKNESS     0.3f
 
-/* ------------------------------------------------------------------ */
-/* Growable vertex list                                                 */
-/* ------------------------------------------------------------------ */
 void vlist_push(VertexList *vl, f32 x, f32 y, f32 z, f32 nx, f32 ny, f32 nz, f32 r, f32 g, f32 b)
 {
     if (vl->count >= vl->capacity) {
@@ -39,19 +32,10 @@ void vertex_list_free(VertexList *vl)
     vl->count = vl->capacity = 0;
 }
 
-/* Face indices shared by both box helpers below -- 6 faces, 2 corners
- * of a diagonal each (a,b,c,d) forming two triangles (a,b,c) and
- * (a,c,d). Face culling is left disabled in main.c specifically so
- * winding order here doesn't matter -- every face renders regardless
- * of which way it winds, trading a little GPU efficiency for one
- * fewer thing that could silently break unverified. */
 static const int FACES[6][4] = {
     {0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {3,2,6,7}, {4,5,1,0},
 };
 
-/* Local (unrotated) outward normal per face, matching FACES above --
- * verified against the actual corner layout (which axis is constant
- * across all 4 corners of each face) rather than derived by eye. */
 static const f32 FACE_NORMALS[6][3] = {
     { 0,  0, -1}, { 0,  0,  1}, {-1,  0,  0}, { 1,  0,  0}, { 0,  1,  0}, { 0, -1,  0},
 };
@@ -72,7 +56,6 @@ static void emit_box_faces(VertexList *vl, const f32 v[8][3], const f32 normals[
     }
 }
 
-/* Axis-aligned box, centered at (cx,cy,cz), given HALF-extents. */
 void push_box(VertexList *vl, f32 cx, f32 cy, f32 cz, f32 hx, f32 hy, f32 hz,
              f32 r, f32 g, f32 b)
 {
@@ -86,9 +69,6 @@ void push_box(VertexList *vl, f32 cx, f32 cy, f32 cz, f32 hx, f32 hy, f32 hz,
     emit_box_faces(vl, v, FACE_NORMALS, r, g, b);
 }
 
-/* Box transformed by an arbitrary world matrix -- used for ramp
- * segments, which need rotation as well as translation. Local
- * corners are centered at the origin with the given half-extents. */
 static void push_box_transformed(VertexList *vl, Mat4 world, f32 hx, f32 hy, f32 hz,
                                  f32 r, f32 g, f32 b)
 {
@@ -105,11 +85,6 @@ static void push_box_transformed(VertexList *vl, Mat4 world, f32 hx, f32 hy, f32
         mat4_transform_point(world, lv[i][0], lv[i][1], lv[i][2],
                               &wv[i][0], &wv[i][1], &wv[i][2]);
 
-    /* mat4_transform_point() applies translation too, which a direction
-     * vector must NOT get -- transforming the origin and subtracting it
-     * back out cancels the translation, leaving just the rotation. Exact
-     * (not an approximation) as long as `world` has no scale, which is
-     * true here (translate * rotate only, see build_ramp_chain). */
     mat4_transform_point(world, 0.0f, 0.0f, 0.0f, &origin_x, &origin_y, &origin_z);
     for (i = 0; i < 6; i++) {
         f32 tx, ty, tz;
@@ -134,8 +109,6 @@ static void push_quad_y(VertexList *vl, f32 y, f32 x0, f32 z0, f32 x1, f32 z1,
     vlist_push(vl, x0, y, z1, 0.0f, normal_y, 0.0f, r, g, b);
 }
 
-/* Matches MapData.gd's WALL_COLORS -- keep in sync by hand (see the
- * COUPLING WARNING in level_geo.h). */
 static void wall_color(int t, f32 *r, f32 *g, f32 *b)
 {
     switch (t) {
@@ -150,31 +123,8 @@ static void wall_color(int t, f32 *r, f32 *g, f32 *b)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Ramp chain detection -- ported from LevelBuilder.gd's              */
-/* _build_ramp_chain(). Same authoring rule: a straight, unbranched   */
-/* run of TILE_RAMP tiles with open floor (0) at the low end and a    */
-/* TILE_PLATFORM tile at the high end.                                 */
-/* ------------------------------------------------------------------ */
 static int g_ramp_visited[MAP_ROWS][MAP_W];
 
-/* Walks a SPECIFIC candidate axis (dx,dy fixed to one of (1,0)/(0,1))
- * starting from query_mx,query_my, and reports whether that axis
- * produces a valid chain. Returns 0 (invalid) rather than guessing --
- * the caller (find_ramp_chain) tries both axes and uses whichever one
- * actually validates, since checking immediate-neighbor walkability
- * alone can't reliably tell direction apart near a junction where
- * multiple ramps converge on the same platform (every such tile has
- * walkable neighbors on BOTH axes, since the surrounding area is open
- * floor either way).
- *
- * Also detects REVERSED chains: a chain is valid whether the low-dx/
- * dy end is open floor and the high end is the platform (normal), OR
- * the low end is the platform and the high end is open floor
- * (reversed) -- both are geometrically valid ramps, just sloping in
- * opposite directions relative to the chain's own index order. Which
- * case applies depends on where the platform sits relative to the
- * ramp, not on which tile you started the query from. */
 static int try_chain_axis(int query_mx, int query_my, int dx, int dy,
                           int chain_mx[], int chain_my[], int *out_index, int *out_reversed)
 {
@@ -212,22 +162,6 @@ static int try_chain_axis(int query_mx, int query_my, int dx, int dy,
     return n;
 }
 
-/* Finds the full straight ramp chain that (query_mx, query_my) is
- * part of (that tile must already be known to be TILE_RAMP), trying
- * horizontal then vertical and using whichever actually validates
- * (see try_chain_axis above for why a single up-front guess isn't
- * reliable). Returns the chain length, or 0 if neither axis produces
- * a valid floor-to-platform (or platform-to-floor) chain. If
- * out_index is non-NULL, set to the query tile's position within the
- * returned chain (0 = whichever end try_chain_axis walked to first).
- * If out_dx/out_dy are non-NULL, set to the chain's walk direction.
- * If out_reversed is non-NULL, set to whether the chain runs
- * platform-to-floor (1) rather than floor-to-platform (0) as index
- * increases -- callers need this to get the height gradient right.
- *
- * Shared by build_ramp_chain() (mesh generation) and
- * level_continuous_ramp_height() (the camera's height query) so there
- * is exactly one implementation of "what chain is this tile part of". */
 static int find_ramp_chain(int query_mx, int query_my, int chain_mx[], int chain_my[],
                            int *out_index, int *out_dx, int *out_dy, int *out_reversed)
 {
@@ -274,16 +208,6 @@ static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
 
     step = PLATFORM_HEIGHT / (f32)n;
     for (i = 0; i < n; i++) {
-        /* h_start/h_end are the heights at this tile's -dx/-dy and
-         * +dx/+dy edges respectively -- SIGNED by chain direction, not
-         * just "the two values sorted". For a reversed chain (platform
-         * at the low-index end), height decreases as i increases, so
-         * h_end < h_start and rise is negative -- that sign is what
-         * makes atan2 tilt the segment the correct way; collapsing it
-         * to a plain min/max would connect the mesh with the right
-         * heights but the wrong slope direction. Verified by hand
-         * that adjacent segments' h_end/h_start match continuously in
-         * both the normal and reversed case. */
         f32 h_start = (reversed ? (f32)(n - i)     : (f32)i)       * step;
         f32 h_end   = (reversed ? (f32)(n - i - 1) : (f32)(i + 1)) * step;
         f32 rise   = h_end - h_start;
@@ -296,11 +220,6 @@ static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
         Mat4 world, rot;
         f32 hx, hy, hz;
 
-        /* dx/dy are always exactly 0 or 1 here (never negative) by
-         * construction above, so there's no sign-of-direction case to
-         * handle beyond which axis is active -- same simplification
-         * LevelBuilder.gd relies on. If a ramp renders tilted the
-         * wrong way, this is the pair of lines to flip the sign on. */
         if (dx != 0) {
             rot = mat4_rotate_z(angle);
             hx = slope_len * 0.5f; hy = RAMP_THICKNESS * 0.5f; hz = TILE_SIZE * 0.5f;
@@ -313,15 +232,6 @@ static void build_ramp_chain(VertexList *vl, int start_mx, int start_my)
     }
 }
 
-/* The camera's CONTINUOUS height while standing on a ramp, computed
- * from its exact fractional position along the chain -- not a
- * per-tile step. This is the actual fix for "have to climb slowly":
- * the old version (level_height_for_tile returning one value per
- * whole tile) still needed an eased transition between tiles, and
- * that easing could only keep up with the target if you crossed each
- * tile slower than the ease rate. A continuous function has nothing
- * to catch up to -- the camera can snap directly to it every frame
- * (see update_camera in main.c) regardless of movement speed. */
 f32 level_continuous_ramp_height(f32 x, f32 y)
 {
     int mx = (int)x, my = (int)y;
@@ -335,17 +245,11 @@ f32 level_continuous_ramp_height(f32 x, f32 y)
     if (frac < 0.0f) frac = 0.0f;
     if (frac > (f32)n) frac = (f32)n;
 
-    /* Reversed: chain_mx[0] is the platform end, not the floor end,
-     * so height runs high-to-low as frac increases -- same reasoning
-     * as build_ramp_chain()'s h_start/h_end. */
     effective_frac = reversed ? ((f32)n - frac) : frac;
 
     return (effective_frac / (f32)n) * PLATFORM_HEIGHT;
 }
 
-/* ------------------------------------------------------------------ */
-/* Public entry points                                                  */
-/* ------------------------------------------------------------------ */
 VertexList build_level_geometry(void)
 {
     VertexList vl;
