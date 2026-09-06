@@ -63,11 +63,11 @@ once, the following commands can be later used to directly start the server and
 run the game on your QNX machine respectively:
 
 ```
-cd game/server_qnx
+./game/server_qnx
 ```
 
 ```
-cd game/qnx_client
+./game/qnx_client
 ```
 
 ## Running the Godot client on your local linux computer
