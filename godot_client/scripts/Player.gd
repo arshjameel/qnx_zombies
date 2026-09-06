@@ -10,7 +10,7 @@ const RECONCILE_LERP := 0.35
 
 const GRAVITY := 9.8
 const JUMP_VELOCITY := 4.5
-
+const GESTURE_TURN_SPEED := deg_to_rad(90.0)
 const LOOK_SPEED := 2.0
 
 var camera: Camera3D
@@ -48,6 +48,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		camera.rotation.x = pitch
 
 func _physics_process(delta: float) -> void:
+	if GestureInput.is_look_left_active():
+		rotate_y(GESTURE_TURN_SPEED * delta)
+	if GestureInput.is_look_right_active():
+		rotate_y(-GESTURE_TURN_SPEED * delta)
 	if Input.is_key_pressed(KEY_LEFT):  rotate_y(LOOK_SPEED * delta)
 	if Input.is_key_pressed(KEY_RIGHT): rotate_y(-LOOK_SPEED * delta)
 	if Input.is_key_pressed(KEY_UP):    pitch += LOOK_SPEED * delta
@@ -59,14 +63,16 @@ func _physics_process(delta: float) -> void:
 	var back := false
 	var left := false
 	var right := false
-	var shoot_held := false
+	var shoot_mouse := false
+	var shoot_gesture := false
 
 	if alive:
-		fwd = Input.is_action_pressed("move_forward")
+		fwd = Input.is_action_pressed("move_forward") or GestureInput.is_walk_forward_active()
 		back = Input.is_action_pressed("move_back")
 		left = Input.is_action_pressed("move_left")
 		right = Input.is_action_pressed("move_right")
-		shoot_held = Input.is_action_pressed("shoot")
+		shoot_mouse = Input.is_action_pressed("shoot")
+		shoot_gesture = GestureInput.is_active()
 
 		var f: Vector3 = -global_transform.basis.z
 		var r: Vector3 = global_transform.basis.x
@@ -103,7 +109,7 @@ func _physics_process(delta: float) -> void:
 		_send_accum = 0.0
 		var f3: Vector3 = -global_transform.basis.z
 		var server_angle := atan2(f3.z, f3.x)
-		Network.send_input(fwd, back, left, right, server_angle, shoot_held, pitch)
+		Network.send_input(fwd, back, left, right, server_angle, shoot_mouse, pitch, shoot_gesture)
 
 func _on_state_updated() -> void:
 	if not Network.players.has(Network.my_id):

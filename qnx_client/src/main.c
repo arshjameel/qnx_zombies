@@ -621,7 +621,10 @@ static void handle_keyboard_event(screen_event_t ev, Camera *cam)
     screen_get_event_property_iv(ev, SCREEN_PROPERTY_FLAGS, &flags);
     screen_get_event_property_iv(ev, SCREEN_PROPERTY_SYM, &sym);
     down  = (flags & KEY_DOWN) ? 1 : 0;
-    lower = sym | 0x20;   
+    lower = sym | 0x20;
+
+    printf("[keydbg] sym=%d (0x%x) lower=%d ('%c') down=%d\n",
+           sym, sym, lower, (lower >= 32 && lower < 127) ? lower : '?', down);
 
     if (lower == 'w') g_key_w = down;
     else if (lower == 'a') g_key_a = down;

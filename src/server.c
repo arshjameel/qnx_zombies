@@ -11,13 +11,18 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+/* ------------------------------------------------------------------ */
+/* Game constants                                                     */
+/* ------------------------------------------------------------------ */
 #define MOVE_SPEED      0.25f
 #define SHOOT_DAMAGE    10
-#define SHOOT_RANGE     100.0f /* can shoot long distances */
+#define SHOOT_RANGE     100.0f 
 #define AMMO_MAX        60
-#define RESPAWN_TICKS   (NET_TICK_RATE * 3)   /* 3 seconds */
+#define RESPAWN_TICKS   (NET_TICK_RATE * 3)   
+#define SHOOT_COOLDOWN_TICKS (NET_TICK_RATE / 6)
 #define PICKUP_RADIUS         0.6f
-#define PICKUP_RESPAWN_TICKS  (NET_TICK_RATE * 12)  /* 12 seconds */
+#define PICKUP_RESPAWN_TICKS  (NET_TICK_RATE * 12)  
 #define AMMO_PICKUP_AMOUNT    15
 #define HEALTH_PICKUP_AMOUNT  25
 #define ZOMBIE_SPEED   0.05f
@@ -30,7 +35,7 @@
 #define BOSS_HEALTH    200
 #define BOSS_DAMAGE    50
 #define ZOMBIE_ATTACK_RANGE       0.8f
-#define ZOMBIE_ATTACK_COOLDOWN    (NET_TICK_RATE * 1)  /* 1 attack/sec */
+#define ZOMBIE_ATTACK_COOLDOWN    (NET_TICK_RATE * 1)  
 #define WAVE_COUNT 4
 
 typedef struct {
@@ -64,10 +69,13 @@ static const f32 ZOMBIE_SPAWN_X[ZOMBIE_SPAWN_COUNT] =
     { 8.5f, 15.5f, 4.5f, 12.5f, 19.5f, 8.5f, 15.5f, 12.5f };
 static const f32 ZOMBIE_SPAWN_Y[ZOMBIE_SPAWN_COUNT] =
     { 2.5f,  2.5f, 11.5f,  6.5f, 11.5f, 21.5f, 21.5f, 20.5f };
-    
+
 #define BOSS_SPAWN_X 12.5f
 #define BOSS_SPAWN_Y 3.5f
 
+/* ------------------------------------------------------------------ */
+/* Server player                                                      */
+/* ------------------------------------------------------------------ */
 typedef struct {
     int                active;
     struct sockaddr_in addr;
@@ -85,6 +93,8 @@ typedef struct {
     f32                inp_pitch;
     u8                 inp_shoot;
     u8                 inp_shoot_prev;
+    u8                 inp_shoot_auto;      
+    int                shoot_auto_cooldown; 
 } ServerPlayer;
 
 typedef struct {
@@ -94,8 +104,8 @@ typedef struct {
     u8  type;           
     f32 x, y;
     f32 z;              
-    u8  health;
-    u8  health_max;      
+    int health;
+    int health_max;      
     int attack_cooldown;
 } ServerZombie;
 
@@ -121,6 +131,9 @@ static u8           g_wave[SESSION_COUNT];
 static int          g_sock = -1;
 static u32          g_tick = 0;
 
+/* ------------------------------------------------------------------ */
+/* Helpers                                                            */
+/* ------------------------------------------------------------------ */
 static double mono_time(void)
 {
     return portable_time();
@@ -186,7 +199,7 @@ static int spawn_one_zombie(u8 session_id, u8 type, f32 x, f32 y)
 {
     int i;
     for (i = 0; i < MAX_ZOMBIES; i++) {
-        u8 hp;
+        int hp;
         if (g_zombies[i].active) continue;
         switch (type) {
             case ZOMBIE_TYPE_TANK: hp = TANK_HEALTH; break;
@@ -341,6 +354,9 @@ static int classify_headshot(int shooter_id, int zombie_id)
     return (hit_y >= head_threshold) ? 1 : 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Packet sending                                                     */
+/* ------------------------------------------------------------------ */
 static void send_to(int player_id, const void *pkt, size_t len)
 {
     sendto(g_sock, pkt, len, 0,
@@ -392,8 +408,8 @@ static void send_state_to_session(u8 session_id)
         zs->x          = g_zombies[i].x;
         zs->y          = g_zombies[i].y;
         zs->z          = g_zombies[i].z;
-        zs->health     = g_zombies[i].health;
-        zs->health_max = g_zombies[i].health_max;
+        zs->health_max = 255;
+        zs->health     = (u8)((g_zombies[i].health * 255) / g_zombies[i].health_max);
     }
     pkt.zombie_count = (u8)zactive;
     pkt.wave         = g_wave[session_id];
@@ -441,6 +457,29 @@ static void broadcast_hit(u8 session_id, u8 victim_id, u8 victim_type, u8 attack
             send_to(i, &pkt, sizeof(pkt));
 }
 
+static void resolve_shot(int shooter_id)
+{
+    ServerPlayer *p   = &g_players[shooter_id];
+    int           hit = shoot_check(shooter_id);
+    if (hit < 0) return;
+
+    {
+        ServerZombie *z    = &g_zombies[hit];
+        int headshot       = classify_headshot(shooter_id, hit);
+        u32 raw_dmg        = headshot ? HEADSHOT_DAMAGE : SHOOT_DAMAGE;
+        u8  dmg            = (raw_dmg > 255u) ? 255u : (u8)raw_dmg;  
+
+        z->health = (z->health > dmg) ? z->health - dmg : 0;
+        broadcast_hit(p->session_id, (u8)hit, ENTITY_ZOMBIE, (u8)shooter_id, dmg, (u8)headshot);
+        if (z->health == 0) {
+            z->alive  = 0;
+            z->active = 0;
+            printf("Zombie %d killed by player %d%s\n",
+                   hit, shooter_id, headshot ? " (HEADSHOT)" : "");
+        }
+    }
+}
+
 static void reset_session(u8 sid)
 {
     int i;
@@ -473,6 +512,9 @@ static void reset_session(u8 sid)
     printf("Session %d: reset for replay\n", sid);
 }
 
+/* ------------------------------------------------------------------ */
+/* Receive loop                                                       */
+/* ------------------------------------------------------------------ */
 static void recv_packets(void)
 {
     u8                 buf[1024];
@@ -517,6 +559,7 @@ static void recv_packets(void)
             g_players[id].inp_look_angle = inp->look_angle;
             g_players[id].inp_pitch      = inp->pitch;
             g_players[id].inp_shoot      = inp->shoot;
+            g_players[id].inp_shoot_auto = inp->shoot_auto;
             break;
         }
 
@@ -546,6 +589,10 @@ static void recv_packets(void)
         }
     }
 }
+
+/* ------------------------------------------------------------------ */
+/* Zombie AI tick                                                     */
+/* ------------------------------------------------------------------ */
 
 static void zombie_height_tick(ServerZombie *z)
 {
@@ -640,6 +687,9 @@ static void zombie_tick(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Game tick                                                          */
+/* ------------------------------------------------------------------ */
 static void game_tick(void)
 {
     int i;
@@ -671,30 +721,25 @@ static void game_tick(void)
 
         if (p->inp_shoot && !p->inp_shoot_prev && p->ammo > 0) {
             p->ammo--;
-            int hit = shoot_check(i);
-            if (hit >= 0) {
-                ServerZombie *z    = &g_zombies[hit];
-                int headshot       = classify_headshot(i, hit);
-                u32 raw_dmg        = headshot ? HEADSHOT_DAMAGE : SHOOT_DAMAGE;
-                u8  dmg            = (raw_dmg > 255u) ? 255u : (u8)raw_dmg;  
-
-                z->health = (z->health > dmg) ? z->health - dmg : 0;
-                broadcast_hit(p->session_id, (u8)hit, ENTITY_ZOMBIE, (u8)i, dmg, (u8)headshot);
-                if (z->health == 0) {
-                    z->alive  = 0;
-                    z->active = 0;
-                    printf("Zombie %d killed by player %d%s\n",
-                           hit, i, headshot ? " (HEADSHOT)" : "");
-                }
-            }
+            resolve_shot(i);
         }
         p->inp_shoot_prev = p->inp_shoot;
+
+        if (p->shoot_auto_cooldown > 0) p->shoot_auto_cooldown--;
+        if (p->inp_shoot_auto && p->shoot_auto_cooldown <= 0 && p->ammo > 0) {
+            p->ammo--;
+            p->shoot_auto_cooldown = SHOOT_COOLDOWN_TICKS;
+            resolve_shot(i);
+        }
     }
 
     zombie_tick();
     pickup_respawn_tick();
 }
 
+/* ------------------------------------------------------------------ */
+/* main                                                               */
+/* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
     u16 port = NET_PORT;

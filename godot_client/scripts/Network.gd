@@ -1,8 +1,9 @@
 extends Node
 
+# protocol constants
 const NET_MAX_PLAYERS := 8
 const MAX_ZOMBIES := 16
-const MAX_PICKUP_SPAWNS := 16   
+const MAX_PICKUP_SPAWNS := 16   # must match map.h's MAX_PICKUP_SPAWNS
 
 const PKT_CONNECT    := 0x01
 const PKT_ACCEPT     := 0x02
@@ -21,12 +22,17 @@ const CONNECT_MODE_SOLO := 1
 const PICKUP_AMMO   := 0
 const PICKUP_HEALTH := 1
 
+const ZOMBIE_TYPE_NORMAL := 0
+const ZOMBIE_TYPE_TANK   := 1
+const ZOMBIE_TYPE_BOSS   := 2
+
+# fixed struct sizes in bytes 
 const HEADER_SIZE       := 6    # u8 + u8 + u32
 const CONNECT_SIZE      := HEADER_SIZE + 1                          # 7
 const ACCEPT_SIZE       := HEADER_SIZE + 1 + 4 + 4 + 4              # 19
-const INPUT_SIZE        := HEADER_SIZE + 1 + 1 + 1 + 1 + 4 + 1 + 4  # 19
+const INPUT_SIZE        := HEADER_SIZE + 1 + 1 + 1 + 1 + 4 + 1 + 4 + 1  # 20
 const PLAYER_STATE_SIZE := 1 + 1 + 4 + 4 + 4 + 1 + 1                # 16
-const ZOMBIE_STATE_SIZE := 1 + 1 + 1 + 4 + 4 + 4 + 1 + 1              # 17 (id, alive, type, x, y, z, health, health_max)
+const ZOMBIE_STATE_SIZE := 1 + 1 + 1 + 4 + 4 + 4 + 1 + 1            # 17
 const PICKUP_STATE_SIZE := 1 + 1 + 1 + 4 + 4                        # 11
 const HIT_SIZE           := HEADER_SIZE + 1 + 1 + 1 + 1 + 1          # 11
 
@@ -94,7 +100,7 @@ func send_disconnect() -> void:
 	is_connected = false
 
 func send_input(forward: bool, back: bool, left: bool, right: bool,
-		look_angle: float, shoot: bool, pitch: float) -> void:
+		look_angle: float, shoot: bool, pitch: float, shoot_auto: bool) -> void:
 	if not is_connected:
 		return
 	var pba := StreamPeerBuffer.new()
@@ -106,6 +112,7 @@ func send_input(forward: bool, back: bool, left: bool, right: bool,
 	pba.put_float(look_angle)
 	pba.put_u8(1 if shoot else 0)
 	pba.put_float(pitch)
+	pba.put_u8(1 if shoot_auto else 0)
 	_udp.put_packet(pba.data_array)
 
 func _send_connect() -> void:

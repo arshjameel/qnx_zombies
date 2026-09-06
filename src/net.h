@@ -4,23 +4,48 @@
 #include "common.h"
 #include "map.h"   
 
+/* ------------------------------------------------------------------ */
+/* Protocol constants                                                 */
+/* ------------------------------------------------------------------ */
 #define NET_PORT         7777
 #define NET_MAX_PLAYERS  8
 #define NET_TICK_RATE    20        
 #define MAX_ZOMBIES      16
-#define PKT_CONNECT     0x01u  
-#define PKT_ACCEPT      0x02u  
-#define PKT_INPUT       0x03u  
-#define PKT_STATE       0x04u 
-#define PKT_HIT         0x06u  
-#define PKT_DISCONNECT  0x07u  
-#define PKT_RESET_SESSION 0x08u  
+
+/* ------------------------------------------------------------------ */
+/* Packet types                                                       */
+/* ------------------------------------------------------------------ */
+#define PKT_CONNECT        0x01u  
+#define PKT_ACCEPT         0x02u  
+#define PKT_INPUT          0x03u  
+#define PKT_STATE          0x04u  
+#define PKT_HIT            0x06u  
+#define PKT_DISCONNECT     0x07u  
+#define PKT_RESET_SESSION  0x08u
+
+/* ------------------------------------------------------------------ */
+/* Entity types                                                       */
+/* ------------------------------------------------------------------ */
 #define ENTITY_PLAYER   0u
 #define ENTITY_ZOMBIE   1u
+
+/* ------------------------------------------------------------------ */
+/* Zombie types                                                       */
+/* ------------------------------------------------------------------ */
+#define ZOMBIE_TYPE_NORMAL  0u
+#define ZOMBIE_TYPE_TANK    1u
+#define ZOMBIE_TYPE_BOSS    2u
+
+/* ------------------------------------------------------------------ */
+/* Pickup types                                                       */
+/* ------------------------------------------------------------------ */
 #define PICKUP_AMMO     0u
 #define PICKUP_HEALTH   1u
 #define ATTACKER_ZOMBIE 0xFFu
 
+/* ------------------------------------------------------------------ */
+/* Packet structures                                                  */
+/* ------------------------------------------------------------------ */
 #pragma pack(push, 1)
 
 typedef struct {
@@ -54,6 +79,7 @@ typedef struct {
     f32       look_angle;    
     u8        shoot;
     f32       pitch;         
+    u8        shoot_auto;
 } PktInput;                                            
 
 typedef struct {
@@ -64,11 +90,7 @@ typedef struct {
     f32 angle;
     u8  health;
     u8  ammo;
-} PlayerState;                                         
-
-#define ZOMBIE_TYPE_NORMAL  0u   
-#define ZOMBIE_TYPE_TANK    1u   
-#define ZOMBIE_TYPE_BOSS    2u   
+} PlayerState;
 
 typedef struct {
     u8  zombie_id;
@@ -78,7 +100,7 @@ typedef struct {
     f32 y;
     f32 z;      
     u8  health;
-    u8  health_max;  
+    u8  health_max;   
 } ZombieState;                                         
 
 typedef struct {
@@ -110,6 +132,10 @@ typedef struct {
 } PktHit;                                              
 
 #pragma pack(pop)
+
+/* ------------------------------------------------------------------ */
+/* Socket helpers                                                     */
+/* ------------------------------------------------------------------ */
 
 int net_udp_socket(void);
 int net_bind(int sock, u16 port);
