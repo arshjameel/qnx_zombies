@@ -1,6 +1,26 @@
 # QNX Zombies
 
-QNX Zombies is a video game submission for the QNX challenge at CuHacking7.
+QNX Zombies is a first person zombie shooter game with cross platform multiplayer 
+support for Linux. It runs using a client-server model, where a given QNX machine 
+can act as both an authoritative server and a client, with the option to connect 
+to other QNX or Linux clients as well, provided that the clients can reach the 
+server's IP over the same network.
+
+The server is responsible for spawning different waves of zombies, and keeps 
+track of every entity’s position, health, and damage over a custom UDP protocol 
+for every client connected to the server.
+
+We wanted to use the OS as the game engine itself, so we built the QNX client as 
+a native 3D client directly using QNX’s Screen API, EGL, and raw OpenGL ES 2.0. 
+The wall texture seen in the video attached is a brick pattern generated live in 
+a shader, with every letter on screen coming from a custom font rasterized at 
+build time.
+
+We also rebuilt this game in Godot to provide Linux support and enable cross 
+platform multiplayer between Linux and QNX, with the option to manually change 
+the IP address it connects to. This client version also includes support for 
+player movement using gesture recognition with OpenCV and MediaPipe, and gameplay 
+using a custom hand held controller, although the latter is still a work in progress.
 
 ## Prerequisites
  
