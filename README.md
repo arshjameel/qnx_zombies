@@ -22,6 +22,8 @@ the IP address it connects to. This client version also includes support for
 player movement using gesture recognition with OpenCV and MediaPipe, and gameplay 
 using a custom hand held controller, although the latter is still a work in progress.
 
+https://github.com/user-attachments/assets/eaccf136-cd71-42eb-b208-cff966b244e0
+
 ## Prerequisites
  
 - Your computer and your QNX machine must be connected to the same network.
